@@ -1,0 +1,1406 @@
+"""
+CareBridge Agent Interaction API
+Exposes the LangGraph Supervisor Agent and Doctor Subgraph for real-time cognitive care coordination.
+Strictly authenticates callers and isolates conversational memory threads per user and case.
+"""
+
+import uuid
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, Optional, List
+from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
+
+from app.database.session import get_async_db
+from app.models.care_case import CareCase, Task
+from app.models.event_audit import CaseEvent
+from app.models.communication import Communication, ConversationSession
+from app.models.appointment import Appointment
+from app.models.owner import CaseOwner
+from app.agents.graph import supervisor_graph
+from app.workflows.doctor_workflow import run_doctor_workflow
+from app.core.security import get_current_user, UserPrincipal
+from app.core.rate_limiter import rate_limit_agent
+from app.schemas.common import ApiResponseEnvelope
+
+router = APIRouter(prefix="/agent", tags=["AI Supervisor Agent"])
+
+
+class PatientInteractionRequest(BaseModel):
+    case_id: Optional[uuid.UUID] = Field(default=None, description="UUID of the active care case (optional for doctors)")
+    message: str = Field(min_length=1, max_length=10000, description="Natural language message from patient or provider")
+    channel: str = Field(default="in_app_chat", description="'in_app_chat', 'sms', 'whatsapp'")
+    sender: Optional[str] = Field(default=None, description="Reported sender (overridden by authenticated role)")
+
+
+class AgentExecutionResponse(BaseModel):
+    case_id: str
+    patient_id: str
+    primary_intent: str
+    emotional_state: str
+    detected_barriers: list
+    actions_executed: list
+    outbound_message: Optional[str]
+    outbound_language: str
+    requires_human_approval: bool
+    approval_request: Optional[Dict[str, Any]] = None
+
+
+class ChatMessageHistoryItem(BaseModel):
+    id: str
+    case_id: Optional[str] = None
+    patient_id: Optional[str] = None
+    session_id: Optional[str] = None
+    sender: str
+    channel: str
+    language: str
+    content: str
+    translated_content: Optional[str] = None
+    acknowledged: bool = False
+    sent_at: datetime
+
+
+class ChatHistoryResponse(BaseModel):
+    messages: List[ChatMessageHistoryItem]
+    total: int
+    case_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class ConversationSessionResponse(BaseModel):
+    id: str
+    patient_id: str
+    case_id: Optional[str] = None
+    channel: str
+    summary: Optional[str] = None
+    unanswered_questions: list = []
+    patient_commitments: list = []
+    is_active: bool
+    last_interaction_at: datetime
+    created_at: datetime
+
+
+class CreateSessionRequest(BaseModel):
+    case_id: Optional[uuid.UUID] = None
+    channel: str = "in_app_chat"
+
+
+@router.post("/interact", response_model=ApiResponseEnvelope[AgentExecutionResponse], dependencies=[Depends(rate_limit_agent)], summary="Interact with CareBridge AI Brain")
+async def interact_with_agent(
+    req: PatientInteractionRequest,
+    current_user: UserPrincipal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Ingests an inbound message, authenticates caller identity and database-backed role,
+    routes to appropriate LangGraph engine (Doctor Subgraph vs Coordinator Supervisor),
+    and strictly isolates conversational state threads per user session.
+    """
+    user_role = current_user.role.lower()
+
+    # =========================================================================
+    # Branch 1: Doctor / Clinician / Specialist Interaction
+    # =========================================================================
+    if user_role in ("clinician", "doctor", "specialist"):
+        doctor_id = current_user.owner_id or str(current_user.user_id)
+        case_id_str = str(req.case_id) if req.case_id else None
+
+        # Execute Doctor Subgraph Workflow (11-node clinical workflow)
+        doc_result = run_doctor_workflow(
+            doctor_id=doctor_id,
+            message=req.message,
+            case_id=case_id_str,
+        )
+
+        response_data = AgentExecutionResponse(
+            case_id=case_id_str or (doc_result.get("case_id") or ""),
+            patient_id=doc_result.get("patient_id") or "",
+            primary_intent=doc_result.get("doctor_intent") or "general_query",
+            emotional_state="clinical_objective",
+            detected_barriers=[],
+            actions_executed=doc_result.get("audit_log", []),
+            outbound_message=doc_result.get("response_message") or "Clinical request processed successfully.",
+            outbound_language="en",
+            requires_human_approval=False,
+            approval_request=None,
+        )
+
+        # Phase 1: Persist doctor query and copilot reply in communications table
+        try:
+            target_cid = None
+            if case_id_str:
+                try:
+                    target_cid = uuid.UUID(case_id_str)
+                except ValueError:
+                    pass
+            elif doc_result.get("case_id"):
+                try:
+                    target_cid = uuid.UUID(doc_result.get("case_id"))
+                except ValueError:
+                    pass
+
+            if target_cid:
+                case_stmt = select(CareCase).where(CareCase.id == target_cid)
+                c_res = await db.execute(case_stmt)
+                doc_cc = c_res.scalar_one_or_none()
+                doc_patient_id = doc_cc.patient_id if doc_cc else (uuid.UUID(doc_result.get("patient_id")) if doc_result.get("patient_id") else None)
+                if doc_patient_id:
+                    now = datetime.now(timezone.utc)
+                    doc_inbound = Communication(
+                        id=uuid.uuid4(),
+                        case_id=target_cid,
+                        patient_id=doc_patient_id,
+                        sender="doctor",
+                        channel=req.channel or "in_app_chat",
+                        language="en",
+                        content=req.message,
+                        acknowledged=True,
+                        sent_at=now
+                    )
+                    doc_outbound = Communication(
+                        id=uuid.uuid4(),
+                        case_id=target_cid,
+                        patient_id=doc_patient_id,
+                        sender="ai_doctor_copilot",
+                        channel=req.channel or "in_app_chat",
+                        language="en",
+                        content=response_data.outbound_message or "Clinical request processed successfully.",
+                        acknowledged=True,
+                        sent_at=now
+                    )
+                    db.add(doc_inbound)
+                    db.add(doc_outbound)
+                    await db.commit()
+        except Exception as e:
+            import logging
+            logging.getLogger("carebridge.agent").warning(f"Doctor communication persistence notice: {e}")
+
+        # Phase 7: Real-time notification dispatch for doctor review completion
+        if case_id_str:
+            try:
+                from app.services.notification_service import NotificationService
+                from app.database.session import get_sync_db
+                with get_sync_db() as sync_db:
+                    c_uuid = uuid.UUID(case_id_str)
+                    cc = sync_db.query(CareCase).filter(CareCase.id == c_uuid).first()
+                    if cc:
+                        p_name = f"{cc.patient.first_name} {cc.patient.last_name}" if cc.patient else None
+                        NotificationService.notify_doctor_review_completed(
+                            db=sync_db,
+                            case_id=cc.id,
+                            patient_id=cc.patient_id,
+                            doctor_name=getattr(current_user, "name", "Dr. Aris Thorne, MD"),
+                            summary=req.message,
+                            patient_name=p_name
+                        )
+            except Exception as e:
+                import logging
+                logging.getLogger("carebridge.agent").warning(f"Doctor review notification notice: {e}")
+
+        return ApiResponseEnvelope(
+            success=True,
+            message="Doctor workflow executed successfully",
+            data=response_data
+        )
+
+    # =========================================================================
+    # Branch 2: Patient Interaction
+    # =========================================================================
+    elif user_role == "patient":
+        care_case: Optional[CareCase] = None
+
+        if req.case_id:
+            case_stmt = (
+                select(CareCase)
+                .options(
+                    selectinload(CareCase.patient),
+                    selectinload(CareCase.current_owner)
+                )
+                .where(CareCase.id == req.case_id)
+            )
+            case_res = await db.execute(case_stmt)
+            care_case = case_res.scalar_one_or_none()
+
+            if not care_case:
+                raise HTTPException(status_code=404, detail=f"Case {req.case_id} not found")
+
+            # Authorization Check: Patient may ONLY access their own care case
+            if not current_user.patient_id or str(care_case.patient_id) != str(current_user.patient_id):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden: You do not have permission to access another patient's care case."
+                )
+        else:
+            # Look up active case for authenticated patient
+            if current_user.patient_id:
+                try:
+                    p_uuid = uuid.UUID(current_user.patient_id)
+                    case_stmt = (
+                        select(CareCase)
+                        .options(
+                            selectinload(CareCase.patient),
+                            selectinload(CareCase.current_owner)
+                        )
+                        .where(CareCase.patient_id == p_uuid)
+                        .order_by(CareCase.created_at.desc())
+                    )
+                    case_res = await db.execute(case_stmt)
+                    care_case = case_res.scalars().first()
+                except ValueError:
+                    pass
+
+            if not care_case:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No active care case found for this patient account."
+                )
+
+        # Step 0: Resolve or initialize active ConversationSession
+        active_session: Optional[ConversationSession] = None
+        try:
+            session_stmt = (
+                select(ConversationSession)
+                .where(
+                    ConversationSession.patient_id == care_case.patient_id,
+                    ConversationSession.is_active.is_(True)
+                )
+                .order_by(ConversationSession.last_interaction_at.desc())
+            )
+            session_res = await db.execute(session_stmt)
+            active_session = session_res.scalars().first()
+
+            now = datetime.now(timezone.utc)
+            if not active_session:
+                active_session = ConversationSession(
+                    id=uuid.uuid4(),
+                    patient_id=care_case.patient_id,
+                    case_id=care_case.id,
+                    channel=req.channel or "in_app_chat",
+                    is_active=True,
+                    last_interaction_at=now
+                )
+                db.add(active_session)
+                await db.flush()
+            else:
+                active_session.last_interaction_at = now
+                if care_case.id and not active_session.case_id:
+                    active_session.case_id = care_case.id
+        except Exception as e:
+            import logging
+            logging.getLogger("carebridge.agent").warning(f"Session resolution notice: {e}")
+
+        # Step 1: Record inbound patient communication for persistent multi-turn conversational context
+        try:
+            inbound_comm = Communication(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                session_id=active_session.id if active_session else None,
+                sender="patient",
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=req.message,
+                acknowledged=True,
+                sent_at=datetime.now(timezone.utc)
+            )
+            db.add(inbound_comm)
+            await db.commit()
+        except Exception as e:
+            import logging
+            logging.getLogger("carebridge.agent").warning(f"Inbound communication persistence notice: {e}")
+
+        now = datetime.now(timezone.utc)
+        patient_first = care_case.patient.first_name if care_case.patient else "Patient"
+        msg_clean = req.message.strip()
+        msg_lower = msg_clean.lower()
+
+        # ---------------------------------------------------------------------
+        # 1. 5 Whys Root-Cause & Barrier Discovery Handler
+        # ---------------------------------------------------------------------
+        if any(kw in msg_lower for kw in ["5 whys", "five whys", "why questions", "root cause"]):
+            five_whys_response = (
+                f"🔍 CareBridge 5 Whys Clinical Root-Cause Discovery for {patient_first}:\n\n"
+                "• Why 1 (Clinical Presentation): Why is the screening or diagnostic evaluation required?\n"
+                "  ➔ To detect abnormal tissue architecture or asymptomatic disease early when treatment is most effective.\n\n"
+                "• Why 2 (Symptom or Guideline Trigger): Why now?\n"
+                "  ➔ Routine guideline surveillance reached, or localized physical discomfort prompted proactive evaluation.\n\n"
+                "• Why 3 (Historical Obstacle): Why have appointments or screenings been delayed previously?\n"
+                "  ➔ Logistical hurdles, lack of caregiver transit, work schedule inflexibility, or anxiety about medical findings.\n\n"
+                "• Why 4 (Coordination Requirement): Why is a dedicated Care Coordinator necessary?\n"
+                "  ➔ Fragmented specialty clinics create confusion. An accountable coordinator ensures barrier removal and continuous follow-up.\n\n"
+                "• Why 5 (Root-Cause Solution): How do we achieve verified health closure?\n"
+                "  ➔ Establish a protected test appointment, provide caregiver transportation, and maintain 100% accountable closed-loop tracking.\n\n"
+                "Your CareBridge team addresses each layer of this root cause. What questions can we answer next?"
+            )
+            out_comm = Communication(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                session_id=active_session.id if active_session else None,
+                sender="ai_coordinator",
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=five_whys_response,
+                acknowledged=True,
+                sent_at=now
+            )
+            db.add(out_comm)
+            await db.commit()
+
+            return ApiResponseEnvelope(
+                success=True,
+                message="5 Whys analysis executed",
+                data=AgentExecutionResponse(
+                    case_id=str(care_case.id),
+                    patient_id=str(care_case.patient_id),
+                    primary_intent="five_whys_root_cause_analysis",
+                    emotional_state="receptive",
+                    detected_barriers=[],
+                    actions_executed=["five_whys_evaluation"],
+                    outbound_message=five_whys_response,
+                    outbound_language="en",
+                    requires_human_approval=False,
+                    approval_request=None,
+                )
+            )
+
+        # ---------------------------------------------------------------------
+        # 2. Case Lifecycle Stage-Aware AI Care Companion Routing
+        # The AI agent stays with the patient from hospital intake through verified closure.
+        # ---------------------------------------------------------------------
+
+        # Look up hospital coordinator
+        owner = care_case.current_owner
+        if not owner:
+            owner_stmt = select(CaseOwner).where(CaseOwner.role == "care_coordinator").limit(1)
+            owner = (await db.execute(owner_stmt)).scalars().first()
+            if owner:
+                care_case.current_owner_id = owner.id
+
+        coord_name = owner.name if owner else "Priya Nair, RN"
+        facility_name = owner.facility if owner else "Metropolitan Hospital Screening Center"
+
+        # Check for active appointments
+        appt_stmt = (
+            select(Appointment)
+            .where(Appointment.case_id == care_case.id)
+            .order_by(Appointment.scheduled_time.desc())
+        )
+        recent_appt = (await db.execute(appt_stmt)).scalars().first()
+
+        # Check if patient missed a scheduled screening or follow-up visit
+        is_missed = (
+            care_case.status in ("missed_visit", "recovery_active")
+            or (recent_appt and recent_appt.status == "no_show")
+        )
+
+        # ---------------------------------------------------------------------
+        # (A) Proactive Recovery: Missed Screening Visit Detected
+        # ---------------------------------------------------------------------
+        if is_missed and not any(term in msg_lower for term in ["5 whys", "five whys"]):
+            appt_time_str = recent_appt.scheduled_time.strftime("%A, %B %d at %I:%M %p") if recent_appt else "your scheduled appointment"
+
+            # Check if patient is providing a rescheduling preference or barrier reason
+            barrier_detected = None
+            if any(term in msg_lower for term in ["car", "ride", "bus", "transit", "traffic", "transport", "drive"]):
+                barrier_detected = "transportation_obstacle"
+            elif any(term in msg_lower for term in ["busy", "work", "job", "shift", "meeting", "time"]):
+                barrier_detected = "work_schedule_inflexibility"
+            elif any(term in msg_lower for term in ["scared", "fear", "anxious", "nervous", "worry"]):
+                barrier_detected = "clinical_anxiety"
+
+            if barrier_detected:
+                ctx = care_case.case_context or {}
+                barriers = ctx.get("inferred_barriers", [])
+                if barrier_detected not in barriers:
+                    barriers.append(barrier_detected)
+                ctx["inferred_barriers"] = barriers
+                care_case.case_context = ctx
+
+            missed_reply = (
+                f"Hello {patient_first}, I noticed that you missed your scheduled screening visit on {appt_time_str} at {facility_name}.\n\n"
+                f"Please know that unexpected things happen and our hospital care team is here to support you without judgment. "
+                f"Your Care Coordinator, {coord_name}, has been notified and we want to ensure you get your screening safely.\n\n"
+                f"Would you prefer to reschedule for later this week or next week? If you need assistance with transportation or timing, please let me know and we will coordinate support for you."
+            )
+
+            out_comm = Communication(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                session_id=active_session.id if active_session else None,
+                sender="ai_coordinator",
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=missed_reply,
+                acknowledged=True,
+                sent_at=now
+            )
+            db.add(out_comm)
+            await db.commit()
+
+            return ApiResponseEnvelope(
+                success=True,
+                message="Missed visit recovery assistance delivered",
+                data=AgentExecutionResponse(
+                    case_id=str(care_case.id),
+                    patient_id=str(care_case.patient_id),
+                    primary_intent="missed_visit_recovery",
+                    emotional_state="empathic",
+                    detected_barriers=[barrier_detected] if barrier_detected else [],
+                    actions_executed=["notify_recovery_outreach", "offer_reschedule"],
+                    outbound_message=missed_reply,
+                    outbound_language="en",
+                    requires_human_approval=False,
+                    approval_request=None,
+                )
+            )
+
+        # ---------------------------------------------------------------------
+        # (B) Patient Intake / Hospital Form Submission Flow
+        # Since patient enters through the hospital website, they are already at the hospital.
+        # We do NOT ask them to choose between coordinators. The hospital coordinator is alerted to update the schedule.
+        # ---------------------------------------------------------------------
+        is_intake = care_case.status in ("intake", "intake_ready", "intake_submitted")
+        has_no_screening_appt = recent_appt is None or recent_appt.appointment_type not in ("screening_evaluation", "screening")
+
+        if is_intake and has_no_screening_appt and not any(term in msg_lower for term in ["5 whys", "five whys"]):
+            # Record patient's health request/theory in case context
+            ctx = care_case.case_context or {}
+            ctx["screening_request"] = msg_clean
+            ctx["onboarding_stage"] = "intake_submitted"
+            care_case.case_context = ctx
+            care_case.status = "intake_submitted"
+
+            # Create Alert Task for Hospital Care Coordinator to update schedule
+            task = Task(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                title=f"Schedule Screening: {patient_first}",
+                description=f"Patient intake received: '{msg_clean}'. Review clinical goals and update screening schedule for patient at {facility_name}.",
+                task_type="schedule_screening",
+                assigned_to_id=owner.id if owner else None,
+                assigned_role="care_coordinator",
+                status="pending",
+                priority="urgent",
+                due_date=now + timedelta(days=2),
+                idempotency_key=f"screening_intake_{care_case.id}"
+            )
+            db.add(task)
+
+            # Record Case Event
+            event = CaseEvent(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                event_type="intake_submitted",
+                description=f"Patient explained screening goals: '{msg_clean}'. Hospital coordinator {coord_name} alerted to update schedule.",
+                event_data={"screening_request": msg_clean, "coordinator": coord_name, "facility": facility_name},
+                timestamp=now
+            )
+            db.add(event)
+
+            intake_reply = (
+                f"Thank you for sharing your health details, {patient_first}. I have recorded your health goals:\n"
+                f"📋 Screening Request: \"{msg_clean}\"\n\n"
+                f"Your hospital Care Coordinator, {coord_name} at {facility_name}, has been alerted with your request. "
+                f"They are reviewing your intake and will update your screening appointment schedule shortly.\n\n"
+                f"Once scheduled, you will receive an instant notification and see the appointment date and location on your patient dashboard.\n\n"
+                f"I will be with you throughout your entire care journey until full clinical closure. "
+                f"In the meantime, feel free to ask me anything about the screening process, how to prepare, or any questions you have!"
+            )
+
+            out_comm = Communication(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                session_id=active_session.id if active_session else None,
+                sender="ai_coordinator",
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=intake_reply,
+                acknowledged=True,
+                sent_at=now
+            )
+            db.add(out_comm)
+            await db.commit()
+
+            return ApiResponseEnvelope(
+                success=True,
+                message="Patient screening request submitted and hospital coordinator alerted",
+                data=AgentExecutionResponse(
+                    case_id=str(care_case.id),
+                    patient_id=str(care_case.patient_id),
+                    primary_intent="patient_intake_submitted",
+                    emotional_state="receptive",
+                    detected_barriers=[],
+                    actions_executed=["record_intake_statement", "alert_coordinator_schedule_task"],
+                    outbound_message=intake_reply,
+                    outbound_language="en",
+                    requires_human_approval=False,
+                    approval_request=None,
+                )
+            )
+
+        # ---------------------------------------------------------------------
+        # (C) Screening Completed Stage (Awaiting Diagnostic Report)
+        # ---------------------------------------------------------------------
+        if care_case.status == "screening_completed" and any(term in msg_lower for term in ["status", "report", "result", "next", "when", "screening", "test"]):
+            completed_reply = (
+                f"Great news, {patient_first}! Your screening procedure at {facility_name} has been successfully completed and verified. "
+                f"Your Care Coordinator, {coord_name}, is currently coordinating with the laboratory and radiology team to finalize your diagnostic report.\n\n"
+                f"As soon as your diagnostic report is ready, your dashboard will update with a notification and you will be able to download your full report. "
+                f"I will remain right here to explain all findings, answer your questions, and guide you through any recommended next steps!"
+            )
+            out_comm = Communication(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                session_id=active_session.id if active_session else None,
+                sender="ai_coordinator",
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=completed_reply,
+                acknowledged=True,
+                sent_at=now
+            )
+            db.add(out_comm)
+            await db.commit()
+            return ApiResponseEnvelope(
+                success=True,
+                message="Screening completed guidance delivered",
+                data=AgentExecutionResponse(
+                    case_id=str(care_case.id),
+                    patient_id=str(care_case.patient_id),
+                    primary_intent="screening_completed_inquiry",
+                    emotional_state="reassured",
+                    detected_barriers=[],
+                    actions_executed=["explain_screening_completion"],
+                    outbound_message=completed_reply,
+                    outbound_language="en",
+                    requires_human_approval=False,
+                    approval_request=None,
+                )
+            )
+
+        # Isolated LangGraph persistence thread for this specific patient and case
+        thread_id = f"patient_{current_user.user_id}_case_{care_case.id}"
+        config = {"configurable": {"thread_id": thread_id}}
+
+        initial_state = {
+            "case_id": str(care_case.id),
+            "patient_id": str(care_case.patient_id),
+            "session_id": str(active_session.id) if active_session else None,
+            "inbound_message": req.message,
+            "inbound_channel": req.channel or "in_app_chat",
+            "inbound_sender": "patient",
+            "patient_context": {},
+            "case_context": {},
+            "conversation_context": {},
+            "intent_analysis": None,
+            "coordination_plan": None,
+            "pending_tool_calls": [],
+            "tool_observations": [],
+            "replanning_needed": False,
+            "requires_human_approval": False,
+            "approval_request": None,
+            "human_decision": None,
+            "outbound_message": None,
+            "outbound_language": "en",
+            "final_case_status": None,
+            "iteration_count": 0,
+            "max_iterations": 5,
+            "audit_entries": [],
+        }
+
+        try:
+            final_state = supervisor_graph.invoke(initial_state, config=config)
+        except Exception as graph_err:
+            from app.core.correlation import get_correlation_id
+            corr_id = get_correlation_id()
+            import logging
+            logging.getLogger("carebridge.agent").error(
+                f"[LLM/Graph Outage] correlation_id={corr_id} error={graph_err}",
+                exc_info=True
+            )
+            now = datetime.now(timezone.utc)
+            task_id = uuid.uuid4()
+            assigned_uuid = None
+            if care_case.current_owner_id:
+                try:
+                    assigned_uuid = uuid.UUID(str(care_case.current_owner_id))
+                except (ValueError, TypeError):
+                    pass
+            esc_task = Task(
+                id=task_id,
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                task_type="clinical_escalation",
+                title="Recoverable Escalation: Clinical Assistant Service Degradation",
+                description=f"Automated care companion encountered service error: {str(graph_err)[:180]}. Human care coordinator outreach required.",
+                status="pending",
+                priority="critical",
+                assigned_to_id=assigned_uuid,
+                assigned_role="care_coordinator",
+                due_date=now + timedelta(hours=24),
+                created_at=now,
+                updated_at=now
+            )
+            db.add(esc_task)
+
+            is_urgent_symptoms = any(
+                w in req.message.lower()
+                for w in ["pain", "bleeding", "severe", "fever", "chest", "dizzy", "lump", "emergency"]
+            )
+            if is_urgent_symptoms:
+                care_case.status = "escalated"
+                care_case.priority = "critical"
+
+            await db.commit()
+
+            from app.workflows.persistence.traces import WorkflowTraceLogger
+            from app.database.session import get_sync_db
+            try:
+                with get_sync_db() as sync_db:
+                    WorkflowTraceLogger.log_node_trace(
+                        db=sync_db,
+                        case_id=str(care_case.id),
+                        thread_id=thread_id,
+                        run_id=corr_id or str(uuid.uuid4()),
+                        workflow_name="carebridge_supervisor",
+                        node_name="supervisor_execution",
+                        step_number=1,
+                        status="failed",
+                        duration_ms=0.0,
+                        error_message=str(graph_err),
+                        coordinator_note="Automated assistant encountered LLM/graph failure; escalation task created",
+                        correlation_id=corr_id,
+                        actor_id=str(current_user.user_id),
+                        db_result="error"
+                    )
+            except Exception:
+                pass
+
+            fallback_msg = (
+                "Our automated care assistant is currently experiencing temporary technical difficulties. "
+                "Your care coordinator and attending clinical team have been notified "
+                "and will follow up with you directly."
+            )
+            return ApiResponseEnvelope(
+                success=True,
+                message="Clinical assistant fallback engaged",
+                data=AgentExecutionResponse(
+                    case_id=str(care_case.id),
+                    patient_id=str(care_case.patient_id),
+                    primary_intent="urgent_clinical_escalation" if is_urgent_symptoms else "general_fallback",
+                    emotional_state="anxious",
+                    detected_barriers=[],
+                    actions_executed=["created_clinical_escalation_task"],
+                    outbound_message=fallback_msg,
+                    outbound_language="en",
+                    requires_human_approval=True,
+                    approval_request={"task_id": str(task_id), "reason": "llm_outage"}
+                )
+            )
+        intent = final_state.get("intent_analysis") or {}
+
+        # Clinical Safeguard: Ensure urgent escalations are committed to PostgreSQL
+        if intent.get("primary_intent") == "urgent_clinical_escalation" or intent.get("requires_human_escalation"):
+            care_case.status = "escalated"
+            care_case.priority = "critical"
+            now = datetime.now(timezone.utc)
+            event_check = await db.execute(
+                select(CaseEvent).where(
+                    CaseEvent.case_id == care_case.id,
+                    CaseEvent.event_type.in_(["case_escalated", "urgent_clinical_escalation"])
+                )
+            )
+            if not event_check.scalars().first():
+                esc_ev = CaseEvent(
+                    id=uuid.uuid4(),
+                    case_id=care_case.id,
+                    event_type="case_escalated",
+                    description="Case escalated to escalated. Urgency: critical. Reason: Patient reported acute clinical symptoms requiring immediate human oversight.",
+                    event_data={"status": "escalated", "urgency": "critical", "reason": "Patient reported acute clinical symptoms requiring immediate human oversight."},
+                    timestamp=now
+                )
+                db.add(esc_ev)
+            await db.commit()
+            await db.refresh(care_case)
+
+            # Phase 7: Real-time notification dispatch for critical clinical escalation
+            try:
+                from app.services.notification_service import NotificationService
+                from app.database.session import get_sync_db
+                with get_sync_db() as sync_db:
+                    p_name = f"{care_case.patient.first_name} {care_case.patient.last_name}" if care_case.patient else "Patient"
+                    NotificationService.notify_clinical_escalation(
+                        db=sync_db,
+                        case_id=care_case.id,
+                        patient_id=care_case.patient_id,
+                        patient_name=p_name,
+                        reason="Patient reported acute clinical symptoms requiring immediate physician review"
+                    )
+            except Exception as e:
+                import logging
+                logging.getLogger("carebridge.agent").warning(f"Escalation notification notice: {e}")
+
+        # Phase 7: Inbound patient message notification for care coordinator
+        # ONLY send coordinator notification if coordinator attention is clinically or administratively needed:
+        # e.g., explicit assistance requests, reported barriers, appointment cancellations/refusals.
+        # DO NOT send notifications for greetings, general inquiries, or routine conversational turns.
+        primary_intent = intent.get("primary_intent", "")
+        should_notify_coordinator = (
+            intent.get("requires_human_escalation", False)
+            or final_state.get("requires_human_approval", False)
+            or primary_intent in (
+                "assistance_request",
+                "appointment_reschedule_with_barrier",
+                "appointment_cancellation_and_refusal",
+                "referral_delay"
+            )
+            or any(
+                b.get("barrier_type") in ("transportation_caregiver", "financial", "childcare_family")
+                for b in intent.get("detected_barriers", [])
+            )
+        )
+
+        if should_notify_coordinator:
+            try:
+                from app.services.notification_service import NotificationService
+                from app.database.session import get_sync_db
+                with get_sync_db() as sync_db:
+                    p_name = getattr(current_user, "name", "Patient")
+                    NotificationService.notify_patient_message(
+                        db=sync_db,
+                        case_id=care_case.id if care_case else None,
+                        patient_id=care_case.patient_id if care_case else uuid.UUID(current_user.patient_id),
+                        patient_name=p_name,
+                        message_preview=req.message
+                    )
+            except Exception as e:
+                import logging
+                logging.getLogger("carebridge.agent").warning(f"Patient message notification notice: {e}")
+
+        response_data = AgentExecutionResponse(
+            case_id=str(care_case.id),
+            patient_id=str(care_case.patient_id),
+            primary_intent=intent.get("primary_intent", "unknown"),
+            emotional_state=intent.get("emotional_state", "neutral"),
+            detected_barriers=intent.get("detected_barriers", []),
+            actions_executed=final_state.get("tool_observations", []),
+            outbound_message=final_state.get("outbound_message"),
+            outbound_language=final_state.get("outbound_language", "en"),
+            requires_human_approval=final_state.get("requires_human_approval", False),
+            approval_request=final_state.get("approval_request"),
+        )
+
+        # Persist outbound AI communication into PostgreSQL for long-term memory
+        try:
+            out_text = final_state.get("outbound_message") or "I am here to support your care pathway."
+            out_comm = Communication(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                session_id=active_session.id if active_session else None,
+                sender="ai_coordinator",
+                channel=req.channel or "in_app_chat",
+                language=final_state.get("outbound_language", "en"),
+                content=out_text,
+                acknowledged=True,
+                sent_at=datetime.now(timezone.utc)
+            )
+            db.add(out_comm)
+            await db.commit()
+        except Exception as e:
+            import logging
+            logging.getLogger("carebridge.agent").warning(f"Outbound communication persistence notice: {e}")
+
+        return ApiResponseEnvelope(
+            success=True,
+            message="Agent cognitive loop executed successfully",
+            data=response_data
+        )
+
+    # =========================================================================
+    # Branch 3: Care Coordinator Interaction
+    # =========================================================================
+    elif user_role in ("care_coordinator", "coordinator"):
+        care_case: Optional[CareCase] = None
+
+        if req.case_id:
+            case_stmt = select(CareCase).options(selectinload(CareCase.patient)).where(CareCase.id == req.case_id)
+            case_res = await db.execute(case_stmt)
+            care_case = case_res.scalar_one_or_none()
+
+            if not care_case:
+                raise HTTPException(status_code=404, detail=f"Case {req.case_id} not found")
+        else:
+            care_case = None  # New coordinator conversation starts with NO pre-loaded patient context!
+
+        if care_case is None:
+            # Coordinator interaction without pre-selected patient context
+            conv_ctx = {"inbound_sender": "care_coordinator", "recent_messages": []}
+            intent = CognitiveEngine.analyze_intent(
+                message=req.message,
+                patient_context={},
+                case_context={},
+                conversation_context=conv_ctx
+            )
+            plan = CognitiveEngine.formulate_plan(intent, {}, {}, conv_ctx)
+
+            tool_observations = []
+            from app.database.session import get_sync_db
+            with get_sync_db() as sync_db:
+                for action in plan.actions:
+                    t_func = getattr(ToolRegistry, action.tool_name, None)
+                    if t_func:
+                        try:
+                            t_res = t_func(sync_db, **action.arguments)
+                            tool_observations.append({
+                                "tool": action.tool_name,
+                                "success": t_res.get("success", True),
+                                "result": t_res
+                            })
+                        except Exception as err:
+                            tool_observations.append({
+                                "tool": action.tool_name,
+                                "success": False,
+                                "error": str(err)
+                            })
+
+            from app.services.response_guard_service import ResponseGuardService
+            outbound_msg = ResponseGuardService.sanitize_response(
+                plan.patient_response_draft,
+                tool_observations=tool_observations,
+                actor_role="care_coordinator"
+            )
+
+            # If discover_new_patients was called, format results into readable overview
+            if intent.primary_intent in ("new_patient_discovery", "coordinator_discovery"):
+                for obs in tool_observations:
+                    if obs.get("tool") == "discover_new_patients" and obs.get("success"):
+                        cases = obs.get("result", {}).get("data", {}).get("cases", [])
+                        if cases:
+                            c_lines = [
+                                f"• {c['patient_name']} ({c['case_number']}): Status: {c['status']}, Priority: {c['priority']}, Finding: {c['finding_code']}"
+                                for c in cases
+                            ]
+                            outbound_msg = (
+                                f"Found {len(cases)} new or unassigned patient case(s) in discovery queue:\n\n"
+                                + "\n".join(c_lines)
+                                + "\n\nTo view details or schedule actions for a patient, say: 'Select patient <name>' or specify the case number."
+                            )
+                        else:
+                            outbound_msg = "There are currently no new unassigned patient cases in the discovery queue."
+
+            response_data = AgentExecutionResponse(
+                case_id="",
+                patient_id="",
+                primary_intent=intent.primary_intent,
+                emotional_state="neutral",
+                detected_barriers=[],
+                actions_executed=tool_observations,
+                outbound_message=outbound_msg,
+                outbound_language="en",
+                requires_human_approval=False,
+                approval_request=None,
+            )
+            return ApiResponseEnvelope(
+                success=True,
+                message="Coordinator discovery request processed",
+                data=response_data
+            )
+
+        # Step 0: Resolve or link active ConversationSession
+        active_session: Optional[ConversationSession] = None
+        try:
+            session_stmt = (
+                select(ConversationSession)
+                .where(
+                    ConversationSession.patient_id == care_case.patient_id,
+                    ConversationSession.is_active.is_(True)
+                )
+                .order_by(ConversationSession.last_interaction_at.desc())
+            )
+            session_res = await db.execute(session_stmt)
+            active_session = session_res.scalars().first()
+            if active_session:
+                active_session.last_interaction_at = datetime.now(timezone.utc)
+        except Exception as e:
+            import logging
+            logging.getLogger("carebridge.agent").warning(f"Coordinator session resolution notice: {e}")
+
+        # Step 1: Record inbound coordinator communication
+        try:
+            inbound_comm = Communication(
+                id=uuid.uuid4(),
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                session_id=active_session.id if active_session else None,
+                sender="care_coordinator",
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=req.message,
+                acknowledged=True,
+                sent_at=datetime.now(timezone.utc)
+            )
+            db.add(inbound_comm)
+            await db.commit()
+        except Exception as e:
+            import logging
+            logging.getLogger("carebridge.agent").warning(f"Coordinator communication persistence notice: {e}")
+
+        thread_id = f"coordinator_{current_user.user_id}_case_{care_case.id}"
+        config = {"configurable": {"thread_id": thread_id}}
+
+        initial_state = {
+            "case_id": str(care_case.id),
+            "patient_id": str(care_case.patient_id),
+            "session_id": str(active_session.id) if active_session else None,
+            "inbound_message": req.message,
+            "inbound_channel": req.channel or "in_app_chat",
+            "inbound_sender": "care_coordinator",
+            "patient_context": {},
+            "case_context": {},
+            "conversation_context": {},
+            "intent_analysis": None,
+            "coordination_plan": None,
+            "pending_tool_calls": [],
+            "tool_observations": [],
+            "replanning_needed": False,
+            "requires_human_approval": False,
+            "approval_request": None,
+            "human_decision": None,
+            "outbound_message": None,
+            "outbound_language": "en",
+            "final_case_status": None,
+            "iteration_count": 0,
+            "max_iterations": 5,
+            "audit_entries": [],
+        }
+
+        try:
+            final_state = supervisor_graph.invoke(initial_state, config=config)
+        except Exception as graph_err:
+            from app.core.correlation import get_correlation_id
+            corr_id = get_correlation_id()
+            import logging
+            logging.getLogger("carebridge.agent").error(
+                f"[LLM/Graph Outage] correlation_id={corr_id} error={graph_err}",
+                exc_info=True
+            )
+            now = datetime.now(timezone.utc)
+            task_id = uuid.uuid4()
+            assigned_uuid = None
+            if care_case.current_owner_id:
+                try:
+                    assigned_uuid = uuid.UUID(str(care_case.current_owner_id))
+                except (ValueError, TypeError):
+                    pass
+            esc_task = Task(
+                id=task_id,
+                case_id=care_case.id,
+                patient_id=care_case.patient_id,
+                task_type="clinical_escalation",
+                title="Recoverable Escalation: Clinical Assistant Service Degradation",
+                description=f"Automated care companion encountered service error: {str(graph_err)[:180]}. Human care coordinator outreach required.",
+                status="pending",
+                priority="critical",
+                assigned_to_id=assigned_uuid,
+                assigned_role="care_coordinator",
+                due_date=now + timedelta(hours=24),
+                created_at=now,
+                updated_at=now
+            )
+            db.add(esc_task)
+
+            is_urgent_symptoms = any(
+                w in req.message.lower()
+                for w in ["pain", "bleeding", "severe", "fever", "chest", "dizzy", "lump", "emergency"]
+            )
+            if is_urgent_symptoms:
+                care_case.status = "escalated"
+                care_case.priority = "critical"
+
+            await db.commit()
+
+            from app.workflows.persistence.traces import WorkflowTraceLogger
+            from app.database.session import get_sync_db
+            try:
+                with get_sync_db() as sync_db:
+                    WorkflowTraceLogger.log_node_trace(
+                        db=sync_db,
+                        case_id=str(care_case.id),
+                        thread_id=thread_id,
+                        run_id=corr_id or str(uuid.uuid4()),
+                        workflow_name="carebridge_supervisor",
+                        node_name="supervisor_execution",
+                        step_number=1,
+                        status="failed",
+                        duration_ms=0.0,
+                        error_message=str(graph_err),
+                        coordinator_note="Automated assistant encountered LLM/graph failure; escalation task created",
+                        correlation_id=corr_id,
+                        actor_id=str(current_user.user_id),
+                        db_result="error"
+                    )
+            except Exception:
+                pass
+
+            fallback_msg = (
+                "Our automated care assistant is currently experiencing temporary technical difficulties. "
+                "Your care coordinator and attending clinical team have been notified "
+                "and will follow up with you directly."
+            )
+            return ApiResponseEnvelope(
+                success=True,
+                message="Clinical assistant fallback engaged",
+                data=AgentExecutionResponse(
+                    case_id=str(care_case.id),
+                    patient_id=str(care_case.patient_id),
+                    primary_intent="urgent_clinical_escalation" if is_urgent_symptoms else "general_fallback",
+                    emotional_state="anxious",
+                    detected_barriers=[],
+                    actions_executed=["created_clinical_escalation_task"],
+                    outbound_message=fallback_msg,
+                    outbound_language="en",
+                    requires_human_approval=True,
+                    approval_request={"task_id": str(task_id), "reason": "llm_outage"}
+                )
+            )
+        intent = final_state.get("intent_analysis") or {}
+
+        # Clinical Safeguard: Ensure urgent escalations are committed to PostgreSQL
+        if intent.get("primary_intent") == "urgent_clinical_escalation" or intent.get("requires_human_escalation"):
+            care_case.status = "escalated"
+            care_case.priority = "critical"
+            now = datetime.now(timezone.utc)
+            event_check = await db.execute(
+                select(CaseEvent).where(
+                    CaseEvent.case_id == care_case.id,
+                    CaseEvent.event_type.in_(["case_escalated", "urgent_clinical_escalation"])
+                )
+            )
+            if not event_check.scalars().first():
+                esc_ev = CaseEvent(
+                    id=uuid.uuid4(),
+                    case_id=care_case.id,
+                    event_type="case_escalated",
+                    description="Case escalated to escalated. Urgency: critical. Reason: Patient reported acute clinical symptoms requiring immediate human oversight.",
+                    event_data={"status": "escalated", "urgency": "critical", "reason": "Patient reported acute clinical symptoms requiring immediate human oversight."},
+                    timestamp=now
+                )
+                db.add(esc_ev)
+            await db.commit()
+            await db.refresh(care_case)
+
+            # Phase 7: Real-time notification dispatch for critical clinical escalation
+            try:
+                from app.services.notification_service import NotificationService
+                from app.database.session import get_sync_db
+                with get_sync_db() as sync_db:
+                    p_name = f"{care_case.patient.first_name} {care_case.patient.last_name}" if care_case.patient else "Patient"
+                    NotificationService.notify_clinical_escalation(
+                        db=sync_db,
+                        case_id=care_case.id,
+                        patient_id=care_case.patient_id,
+                        patient_name=p_name,
+                        reason="Patient reported acute clinical symptoms requiring immediate physician review"
+                    )
+            except Exception as e:
+                import logging
+                logging.getLogger("carebridge.agent").warning(f"Escalation notification notice: {e}")
+
+        # Phase 7: Inbound patient message notification for care coordinator
+        # ONLY send coordinator notification if coordinator attention is clinically or administratively needed:
+        # e.g., explicit assistance requests, reported barriers, appointment cancellations/refusals.
+        # DO NOT send notifications for greetings, general inquiries, or routine conversational turns.
+        primary_intent = intent.get("primary_intent", "")
+        should_notify_coordinator = (
+            intent.get("requires_human_escalation", False)
+            or final_state.get("requires_human_approval", False)
+            or primary_intent in (
+                "assistance_request",
+                "appointment_reschedule_with_barrier",
+                "appointment_cancellation_and_refusal",
+                "referral_delay"
+            )
+            or any(
+                b.get("barrier_type") in ("transportation_caregiver", "financial", "childcare_family")
+                for b in intent.get("detected_barriers", [])
+            )
+        )
+
+        if should_notify_coordinator:
+            try:
+                from app.services.notification_service import NotificationService
+                from app.database.session import get_sync_db
+                with get_sync_db() as sync_db:
+                    p_name = getattr(current_user, "name", "Patient")
+                    NotificationService.notify_patient_message(
+                        db=sync_db,
+                        case_id=care_case.id if care_case else None,
+                        patient_id=care_case.patient_id if care_case else uuid.UUID(current_user.patient_id),
+                        patient_name=p_name,
+                        message_preview=req.message
+                    )
+            except Exception as e:
+                import logging
+                logging.getLogger("carebridge.agent").warning(f"Patient message notification notice: {e}")
+
+        response_data = AgentExecutionResponse(
+            case_id=str(care_case.id),
+            patient_id=str(care_case.patient_id),
+            primary_intent=intent.get("primary_intent", "coordinator_inquiry"),
+            emotional_state=intent.get("emotional_state", "objective"),
+            detected_barriers=intent.get("detected_barriers", []),
+            actions_executed=final_state.get("tool_observations", []),
+            outbound_message=final_state.get("outbound_message"),
+            outbound_language=final_state.get("outbound_language", "en"),
+            requires_human_approval=final_state.get("requires_human_approval", False),
+            approval_request=final_state.get("approval_request"),
+        )
+
+        return ApiResponseEnvelope(
+            success=True,
+            message="Coordinator supervisor workflow executed successfully",
+            data=response_data
+        )
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Forbidden: Role '{user_role}' is not authorized to interact with the CareBridge AI Brain."
+        )
+
+
+@router.get("/history", response_model=ApiResponseEnvelope[ChatHistoryResponse], summary="Retrieve Persistent Chat History")
+async def get_chat_history(
+    case_id: Optional[uuid.UUID] = None,
+    session_id: Optional[uuid.UUID] = None,
+    limit: int = 50,
+    offset: int = 0,
+    current_user: UserPrincipal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Retrieves chronological, PostgreSQL-backed conversation history with role authorization.
+    Patients are strictly isolated to their own records.
+    """
+    user_role = current_user.role.lower()
+    p_id: Optional[uuid.UUID] = None
+
+    if user_role == "patient":
+        if not current_user.patient_id:
+            raise HTTPException(status_code=403, detail="Forbidden: No patient profile associated with account.")
+        p_id = uuid.UUID(current_user.patient_id)
+        if case_id:
+            case_stmt = select(CareCase).where(CareCase.id == case_id)
+            case_res = await db.execute(case_stmt)
+            care_case = case_res.scalar_one_or_none()
+            if not care_case:
+                raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+            if care_case.patient_id != p_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden: You do not have permission to access another patient's communication history."
+                )
+    elif user_role in ("clinician", "doctor", "specialist"):
+        if case_id:
+            case_stmt = select(CareCase).where(CareCase.id == case_id)
+            case_res = await db.execute(case_stmt)
+            care_case = case_res.scalar_one_or_none()
+            if not care_case:
+                raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+            p_id = care_case.patient_id
+    elif user_role in ("care_coordinator", "coordinator"):
+        if case_id:
+            case_stmt = select(CareCase).where(CareCase.id == case_id)
+            case_res = await db.execute(case_stmt)
+            care_case = case_res.scalar_one_or_none()
+            if not care_case:
+                raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+            p_id = care_case.patient_id
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Forbidden: Role '{user_role}' is not authorized to access chat history."
+        )
+
+    # Base query
+    query = select(Communication)
+    if p_id:
+        query = query.where(Communication.patient_id == p_id)
+    if case_id:
+        query = query.where(Communication.case_id == case_id)
+    if session_id:
+        query = query.where(Communication.session_id == session_id)
+
+    count_query = select(func.count()).select_from(query.subquery())
+    total_res = await db.execute(count_query)
+    total = total_res.scalar_one()
+
+    # Query chronological order
+    query = query.order_by(Communication.sent_at.asc()).offset(offset).limit(min(limit, 100))
+    comm_res = await db.execute(query)
+    records = comm_res.scalars().all()
+
+    messages = [
+        ChatMessageHistoryItem(
+            id=str(r.id),
+            case_id=str(r.case_id) if r.case_id else None,
+            patient_id=str(r.patient_id) if r.patient_id else None,
+            session_id=str(r.session_id) if r.session_id else None,
+            sender=r.sender,
+            channel=r.channel,
+            language=r.language,
+            content=r.content,
+            translated_content=r.translated_content,
+            acknowledged=r.acknowledged,
+            sent_at=r.sent_at
+        )
+        for r in records
+    ]
+
+    return ApiResponseEnvelope(
+        success=True,
+        message=f"Retrieved {len(messages)} conversation history records.",
+        data=ChatHistoryResponse(
+            messages=messages,
+            total=total,
+            case_id=str(case_id) if case_id else None,
+            session_id=str(session_id) if session_id else None
+        )
+    )
+
+
+@router.get("/sessions", response_model=ApiResponseEnvelope[List[ConversationSessionResponse]], summary="List Conversation Sessions")
+async def get_conversation_sessions(
+    case_id: Optional[uuid.UUID] = None,
+    current_user: UserPrincipal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """Retrieves conversation sessions for the authorized user / care case."""
+    user_role = current_user.role.lower()
+    p_id: Optional[uuid.UUID] = None
+
+    if user_role == "patient":
+        if not current_user.patient_id:
+            raise HTTPException(status_code=403, detail="Forbidden: No patient profile associated with account.")
+        p_id = uuid.UUID(current_user.patient_id)
+    elif user_role in ("clinician", "doctor", "specialist", "care_coordinator", "coordinator"):
+        if case_id:
+            case_stmt = select(CareCase).where(CareCase.id == case_id)
+            case_res = await db.execute(case_stmt)
+            care_case = case_res.scalar_one_or_none()
+            if care_case:
+                p_id = care_case.patient_id
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Forbidden: Role '{user_role}' is not authorized to access sessions."
+        )
+
+    query = select(ConversationSession)
+    if p_id:
+        query = query.where(ConversationSession.patient_id == p_id)
+    if case_id:
+        query = query.where(ConversationSession.case_id == case_id)
+
+    query = query.order_by(ConversationSession.last_interaction_at.desc())
+    res = await db.execute(query)
+    sessions = res.scalars().all()
+
+    session_items = [
+        ConversationSessionResponse(
+            id=str(s.id),
+            patient_id=str(s.patient_id),
+            case_id=str(s.case_id) if s.case_id else None,
+            channel=s.channel,
+            summary=s.summary,
+            unanswered_questions=s.unanswered_questions or [],
+            patient_commitments=s.patient_commitments or [],
+            is_active=s.is_active,
+            last_interaction_at=s.last_interaction_at,
+            created_at=s.created_at
+        )
+        for s in sessions
+    ]
+
+    return ApiResponseEnvelope(
+        success=True,
+        message=f"Retrieved {len(session_items)} conversation sessions.",
+        data=session_items
+    )
+
+
+@router.post("/sessions", response_model=ApiResponseEnvelope[ConversationSessionResponse], summary="Create New Conversation Session")
+async def create_conversation_session(
+    req: CreateSessionRequest,
+    current_user: UserPrincipal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """Creates a new active conversation session, retiring previous active sessions."""
+    user_role = current_user.role.lower()
+    p_id: Optional[uuid.UUID] = None
+
+    if user_role == "patient":
+        if not current_user.patient_id:
+            raise HTTPException(status_code=403, detail="Forbidden: No patient profile associated with account.")
+        p_id = uuid.UUID(current_user.patient_id)
+    elif user_role in ("clinician", "doctor", "specialist", "care_coordinator", "coordinator"):
+        if req.case_id:
+            case_stmt = select(CareCase).where(CareCase.id == req.case_id)
+            case_res = await db.execute(case_stmt)
+            care_case = case_res.scalar_one_or_none()
+            if not care_case:
+                raise HTTPException(status_code=404, detail="Care case not found.")
+            p_id = care_case.patient_id
+        else:
+            raise HTTPException(status_code=400, detail="case_id is required to create session as clinician/coordinator.")
+    else:
+        raise HTTPException(status_code=403, detail=f"Forbidden: Role '{user_role}' cannot create conversation sessions.")
+
+    # Mark existing active sessions as inactive
+    active_stmt = select(ConversationSession).where(
+        ConversationSession.patient_id == p_id,
+        ConversationSession.is_active.is_(True)
+    )
+    if req.case_id:
+        active_stmt = active_stmt.where(ConversationSession.case_id == req.case_id)
+    active_res = await db.execute(active_stmt)
+    for existing in active_res.scalars().all():
+        existing.is_active = False
+
+    now = datetime.now(timezone.utc)
+    new_session = ConversationSession(
+        id=uuid.uuid4(),
+        patient_id=p_id,
+        case_id=req.case_id,
+        channel=req.channel or "in_app_chat",
+        is_active=True,
+        last_interaction_at=now
+    )
+    db.add(new_session)
+    await db.commit()
+    await db.refresh(new_session)
+
+    return ApiResponseEnvelope(
+        success=True,
+        message="Created new conversation session.",
+        data=ConversationSessionResponse(
+            id=str(new_session.id),
+            patient_id=str(new_session.patient_id),
+            case_id=str(new_session.case_id) if new_session.case_id else None,
+            channel=new_session.channel,
+            summary=new_session.summary,
+            unanswered_questions=new_session.unanswered_questions or [],
+            patient_commitments=new_session.patient_commitments or [],
+            is_active=new_session.is_active,
+            last_interaction_at=new_session.last_interaction_at,
+            created_at=new_session.created_at
+        )
+    )
