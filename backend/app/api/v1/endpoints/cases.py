@@ -1511,3 +1511,107 @@ async def finalize_report(
             "stage_2_completed": True
         }
     )
+
+
+class ExplainReportRequest(BaseModel):
+    language: Optional[str] = Field("en", description="Target language (en, es, ar, ta)")
+
+
+@router.post("/{case_id}/explain-report", response_model=ApiResponseEnvelope[Dict[str, Any]], summary="Patient AI Plain-Language Report Explanation")
+async def explain_case_report(
+    case_id: uuid.UUID,
+    req: Optional[ExplainReportRequest] = None,
+    current_user: UserPrincipal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Translates finalized diagnostic report into empathetic, Grade 6-8 plain language
+    with 6 structured sections, reviewed glossary terms, and advances Stage 4 (PATIENT_UNDERSTANDS).
+    """
+    from app.services.report_explanation_service import ReportExplanationService
+
+    lang = req.language if req and req.language else "en"
+    with get_sync_db() as sync_db:
+        result = ReportExplanationService.generate_explanation(
+            db=sync_db,
+            case_id=case_id,
+            language=lang,
+            actor_role=current_user.role.lower() if current_user.role.lower() in ("patient", "care_coordinator") else "ai_coordinator",
+            actor_id=str(current_user.user_id)
+        )
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result.get("error", "Could not generate report explanation.")
+        )
+
+    return ApiResponseEnvelope(
+        success=True,
+        message="Plain-language report explanation generated and Stage 4 completed.",
+        data=result["data"]
+    )
+
+
+@router.get("/{case_id}/explain-report/stream", summary="Stream Plain-Language Report Explanation via SSE")
+async def stream_case_report_explanation(
+    case_id: uuid.UUID,
+    lang: str = Query("en"),
+    current_user: UserPrincipal = Depends(get_current_user)
+):
+    """
+    Streams the plain-language report explanation as Server-Sent Events (SSE),
+    persisting full text and completing Stage 4 upon completion.
+    """
+    import json
+    import asyncio
+    from fastapi.responses import StreamingResponse
+    from app.services.report_explanation_service import ReportExplanationService
+
+    async def event_generator():
+        with get_sync_db() as sync_db:
+            result = ReportExplanationService.generate_explanation(
+                db=sync_db,
+                case_id=case_id,
+                language=lang,
+                actor_role=current_user.role.lower() if current_user.role.lower() in ("patient", "care_coordinator") else "ai_coordinator",
+                actor_id=str(current_user.user_id)
+            )
+
+        if not result.get("success"):
+            err_payload = json.dumps({"error": result.get("error", "Could not read this report text.")})
+            yield f"event: error\ndata: {err_payload}\n\n"
+            return
+
+        data = result["data"]
+        sections = [
+            ("What your report says", data["what_your_report_says"]),
+            ("What these words mean", data["what_these_words_mean"]),
+            ("What your report recommends", data["what_your_report_recommends"]),
+            ("What is not certain", data["what_is_not_certain"]),
+            ("Questions you may want to ask your doctor", data["questions_for_doctor"]),
+            ("Warm closing", data["warm_closing"]),
+        ]
+
+        for heading, body in sections:
+            chunk = json.dumps({"section": heading, "content": body})
+            yield f"event: section\ndata: {chunk}\n\n"
+            await asyncio.sleep(0.02)
+
+        done_payload = json.dumps({
+            "stage_4_completed": True,
+            "structured_summary": data["structured_summary"],
+            "matched_glossary_ids": data["matched_glossary_ids"],
+            "unknown_terms": data["unknown_terms"]
+        })
+        yield f"event: done\ndata: {done_payload}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
