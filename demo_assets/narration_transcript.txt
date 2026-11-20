@@ -1,0 +1,59 @@
+A screening journey is only complete when care happens.
+
+This is CareBridge — closing the screening-to-care loop.
+
+The patient signs in and speaks naturally with the role-aware AI assistant.
+
+It captures the screening need and creates a real task for the Care Coordinator.
+
+Watch the coordinator notification arrive — from a persisted task, not from a chat promise.
+
+The coordinator creates the screening order.
+
+Notice Stage One remains pending: an order alone is not proof that screening took place.
+
+Once the performed screening is recorded, the timeline advances — and Stage One turns green.
+
+Next, the coordinator uploads the actual screening report as a PDF.
+
+Upload alone does not complete Stage Two.
+
+The report is finalized and validated. Only then does Stage Two complete.
+
+The patient is notified, and that notification is recorded.
+
+The patient asks what the report means.
+
+The assistant retrieves the actual case report and explains it in clear language.
+
+It does not diagnose.
+
+Delivery of that explanation is recorded as evidence for Stage Four — it does not assume the patient understood everything.
+
+For the remaining journey, we switch to a pre-seeded synthetic case.
+
+A doctor reviews the findings and records the clinical decision.
+
+The patient receives the next-step confirmation.
+
+A referral is created, then accepted by the receiving provider.
+
+Stage Nine turns green only after the doctor and patient confirm the same appointment version.
+
+After the consultation is recorded by the doctor, Stage Ten completes.
+
+Treatment monitoring, follow-up, and documentation advance from their own recorded evidence.
+
+Now test the boundary: the Care Coordinator attempts to close the case — and is blocked.
+
+Only an authorized doctor can complete the closure review and sign off.
+
+The timeline shows fourteen of fourteen stages — with timestamps and supporting evidence.
+
+Patient, doctor, and care coordinator share one PostgreSQL-backed workflow.
+
+English, Arabic, and Spanish.
+
+Synthetic data only.
+
+Team Ai_Mavericks.

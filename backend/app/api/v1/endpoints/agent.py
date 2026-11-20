@@ -220,6 +220,50 @@ async def generate_agent_stream(
                 db.add(active_session)
                 await db.flush()
 
+            # Idempotency check: prevent duplicate submission within 10s in the same session or for the same user
+            msg_norm = req.message.strip().lower()
+            recent_cutoff = now - timedelta(seconds=10)
+            dup_in_stmt = (
+                select(Communication)
+                .where(
+                    Communication.session_id == active_session.id,
+                    Communication.sender == user_role,
+                    Communication.sent_at >= recent_cutoff,
+                )
+                .order_by(Communication.sent_at.desc())
+                .limit(1)
+            )
+            dup_in = (await db.execute(dup_in_stmt)).scalars().first()
+            if dup_in and (dup_in.content or "").strip().lower() == msg_norm:
+                dup_out_stmt = (
+                    select(Communication)
+                    .where(
+                        Communication.session_id == active_session.id,
+                        Communication.sender.in_(("ai", "ai_coordinator", "ai_doctor_copilot")),
+                        Communication.sent_at >= dup_in.sent_at,
+                    )
+                    .order_by(Communication.sent_at.desc())
+                    .limit(1)
+                )
+                dup_out = (await db.execute(dup_out_stmt)).scalars().first()
+                if dup_out and dup_out.content:
+                    cached_text = dup_out.content
+                    words = cached_text.split(" ")
+                    for i, word in enumerate(words):
+                        token = word + (" " if i < len(words) - 1 else "")
+                        yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                    final_payload = {
+                        "session_id": str(active_session.id),
+                        "content": cached_text,
+                        "primary_intent": "idempotent_replay",
+                        "actions": [],
+                        "language": dup_out.language or "en",
+                        "title": active_session.title,
+                        "completed": True,
+                    }
+                    yield f"event: final\ndata: {json.dumps(final_payload)}\n\n"
+                    return
+
             # Record inbound Communication
             inbound_comm = Communication(
                 id=uuid.uuid4(),
@@ -922,44 +966,88 @@ async def interact_with_agent(
                     detail="No active care case found for this patient account."
                 )
 
-        # Step 0: Resolve or initialize active ConversationSession
-        active_session: Optional[ConversationSession] = None
+        # Step 0: Ensure active ConversationSession has patient_id and case_id attached
+        now = datetime.now(timezone.utc)
+        turn_start_time = now
         try:
-            session_stmt = (
-                select(ConversationSession)
-                .where(
-                    ConversationSession.patient_id == care_case.patient_id,
-                    ConversationSession.is_active.is_(True)
+            if not req.session_id:
+                session_stmt = (
+                    select(ConversationSession)
+                    .where(
+                        ConversationSession.patient_id == care_case.patient_id,
+                        ConversationSession.is_active.is_(True),
+                        ConversationSession.id != (active_session.id if active_session else uuid.uuid4()),
+                    )
+                    .order_by(ConversationSession.last_interaction_at.desc())
                 )
-                .order_by(ConversationSession.last_interaction_at.desc())
-            )
-            session_res = await db.execute(session_stmt)
-            active_session = session_res.scalars().first()
-
-            now = datetime.now(timezone.utc)
-            if not active_session:
-                active_session = ConversationSession(
-                    id=uuid.uuid4(),
-                    patient_id=care_case.patient_id,
-                    case_id=care_case.id,
-                    channel=req.channel or "in_app_chat",
-                    is_active=True,
-                    last_interaction_at=now
-                )
-                db.add(active_session)
-                await db.flush()
-            else:
+                session_res = await db.execute(session_stmt)
+                existing_patient_sess = session_res.scalars().first()
+                if existing_patient_sess:
+                    if active_session:
+                        await db.delete(active_session)
+                    active_session = existing_patient_sess
+            if active_session:
                 active_session.last_interaction_at = now
+                if not active_session.patient_id:
+                    active_session.patient_id = care_case.patient_id
                 if care_case.id and not active_session.case_id:
                     active_session.case_id = care_case.id
         except Exception as e:
             import logging
             logging.getLogger("carebridge.agent").warning(f"Session resolution notice: {e}")
 
+        # Idempotency check: prevent duplicate submission within 10s for the same case/session
+        msg_clean = req.message.strip()
+        msg_lower = msg_clean.lower()
+        recent_cutoff = now - timedelta(seconds=10)
+        dup_in_stmt = (
+            select(Communication)
+            .where(
+                Communication.case_id == care_case.id,
+                Communication.sender == "patient",
+                Communication.sent_at >= recent_cutoff,
+            )
+            .order_by(Communication.sent_at.desc())
+            .limit(1)
+        )
+        dup_in = (await db.execute(dup_in_stmt)).scalars().first()
+        if dup_in and (dup_in.content or "").strip().lower() == msg_lower:
+            dup_out_stmt = (
+                select(Communication)
+                .where(
+                    Communication.case_id == care_case.id,
+                    Communication.sender.in_(("ai", "ai_coordinator")),
+                    Communication.sent_at >= dup_in.sent_at,
+                )
+                .order_by(Communication.sent_at.desc())
+                .limit(1)
+            )
+            dup_out = (await db.execute(dup_out_stmt)).scalars().first()
+            if dup_out and dup_out.content:
+                return ApiResponseEnvelope(
+                    success=True,
+                    message="Idempotent replay of assistant response",
+                    data=AgentExecutionResponse(
+                        case_id=str(care_case.id),
+                        patient_id=str(care_case.patient_id),
+                        session_id=str(active_session.id) if active_session else None,
+                        primary_intent="idempotent_replay",
+                        emotional_state="neutral",
+                        detected_barriers=[],
+                        actions_executed=[],
+                        outbound_message=dup_out.content,
+                        outbound_language=dup_out.language or "en",
+                        requires_human_approval=False,
+                        approval_request=None,
+                    ),
+                )
+
         # Step 1: Record inbound patient communication for persistent multi-turn conversational context
         try:
             inbound_comm = Communication(
                 id=uuid.uuid4(),
+                user_id=current_user.user_id,
+                role="patient",
                 case_id=care_case.id,
                 patient_id=care_case.patient_id,
                 session_id=active_session.id if active_session else None,
@@ -978,8 +1066,65 @@ async def interact_with_agent(
 
         now = datetime.now(timezone.utc)
         patient_first = care_case.patient.first_name if care_case.patient else "Patient"
-        msg_clean = req.message.strip()
-        msg_lower = msg_clean.lower()
+
+        # Detect language for behaviour router
+        detected_language = "en"
+        if any("\u0600" <= c <= "\u06ff" for c in req.message):
+            detected_language = "ar"
+        elif any(w in msg_lower for w in ["hola", "cita", "dolor", "miedo", "gracias", "el doctor", "informe", "por favor"]):
+            detected_language = "es"
+
+        # 0. Deterministic Patient Behaviour Router (B1-B4, greetings, screening request workflow)
+        if active_session is not None:
+            behaviour_result = await _run_behaviour_turn(current_user, active_session, req, detected_language)
+            if behaviour_result is not None:
+                prev_ai_stmt = (
+                    select(Communication)
+                    .where(
+                        Communication.session_id == active_session.id,
+                        Communication.sender.in_(("ai", "ai_coordinator")),
+                    )
+                    .order_by(Communication.sent_at.desc())
+                    .limit(1)
+                )
+                prev_ai_comm = (await db.execute(prev_ai_stmt)).scalars().first()
+                guarded_text = ResponseGuardService.sanitize_response(
+                    behaviour_result.reply,
+                    tool_observations=behaviour_result.tool_observations,
+                    actor_role="patient",
+                    previous_reply=prev_ai_comm.content if prev_ai_comm else None,
+                    language=detected_language,
+                )
+                guarded_behaviour = BehaviourResult(
+                    reply=guarded_text,
+                    intent=behaviour_result.intent,
+                    tool_observations=behaviour_result.tool_observations,
+                    post_delivery=behaviour_result.post_delivery,
+                    escalated=behaviour_result.escalated,
+                    case_id=behaviour_result.case_id or str(care_case.id),
+                )
+                await _finalize_behaviour_turn(
+                    guarded_behaviour, active_session, current_user, req, detected_language
+                )
+                return ApiResponseEnvelope(
+                    success=True,
+                    message="Patient behaviour turn executed",
+                    data=AgentExecutionResponse(
+                        case_id=str(care_case.id),
+                        patient_id=str(care_case.patient_id),
+                        session_id=str(active_session.id),
+                        primary_intent=guarded_behaviour.intent,
+                        emotional_state="supportive",
+                        detected_barriers=[],
+                        actions_executed=[
+                            obs.get("tool") for obs in guarded_behaviour.tool_observations if obs.get("success")
+                        ],
+                        outbound_message=guarded_text,
+                        outbound_language=detected_language,
+                        requires_human_approval=False,
+                        approval_request=None,
+                    ),
+                )
 
         # ---------------------------------------------------------------------
         # 1. 5 Whys Root-Cause & Barrier Discovery Handler
@@ -1209,47 +1354,6 @@ async def interact_with_agent(
                 )
             )
 
-        # ---------------------------------------------------------------------
-        # (C) Screening Completed Stage (Awaiting Diagnostic Report)
-        # ---------------------------------------------------------------------
-        if care_case.status == "screening_completed" and any(term in msg_lower for term in ["status", "report", "result", "next", "when", "screening", "test"]):
-            completed_reply = (
-                f"Great news, {patient_first}! Your screening procedure at {facility_name} has been successfully completed and verified. "
-                f"Your Care Coordinator, {coord_name}, is currently coordinating with the laboratory and radiology team to finalize your diagnostic report.\n\n"
-                f"As soon as your diagnostic report is ready, your dashboard will update with a notification and you will be able to download your full report. "
-                f"I will remain right here to explain all findings, answer your questions, and guide you through any recommended next steps!"
-            )
-            out_comm = Communication(
-                id=uuid.uuid4(),
-                case_id=care_case.id,
-                patient_id=care_case.patient_id,
-                session_id=active_session.id if active_session else None,
-                sender="ai_coordinator",
-                channel=req.channel or "in_app_chat",
-                language="en",
-                content=completed_reply,
-                acknowledged=True,
-                sent_at=now
-            )
-            db.add(out_comm)
-            await db.commit()
-            return ApiResponseEnvelope(
-                success=True,
-                message="Screening completed guidance delivered",
-                data=AgentExecutionResponse(
-                    case_id=str(care_case.id),
-                    patient_id=str(care_case.patient_id),
-                    primary_intent="screening_completed_inquiry",
-                    emotional_state="reassured",
-                    detected_barriers=[],
-                    actions_executed=["explain_screening_completion"],
-                    outbound_message=completed_reply,
-                    outbound_language="en",
-                    requires_human_approval=False,
-                    approval_request=None,
-                )
-            )
-
         # Isolated LangGraph persistence thread for this specific patient and case
         thread_id = f"patient_{current_user.user_id}_case_{care_case.id}"
         config = {"configurable": {"thread_id": thread_id}}
@@ -1463,21 +1567,42 @@ async def interact_with_agent(
         )
 
         # Persist outbound AI communication into PostgreSQL for long-term memory
+        # Prevent double persistence if supervisor_graph tools already wrote an ai_coordinator row this turn
         try:
             out_text = final_state.get("outbound_message") or "I am here to support your care pathway."
-            out_comm = Communication(
-                id=uuid.uuid4(),
-                case_id=care_case.id,
-                patient_id=care_case.patient_id,
-                session_id=active_session.id if active_session else None,
-                sender="ai_coordinator",
-                channel=req.channel or "in_app_chat",
-                language=final_state.get("outbound_language", "en"),
-                content=out_text,
-                acknowledged=True,
-                sent_at=datetime.now(timezone.utc)
+            existing_out_stmt = (
+                select(Communication)
+                .where(
+                    Communication.case_id == care_case.id,
+                    Communication.sender.in_(("ai", "ai_coordinator")),
+                    Communication.sent_at >= turn_start_time,
+                )
+                .order_by(Communication.sent_at.asc())
             )
-            db.add(out_comm)
+            existing_outs = (await db.execute(existing_out_stmt)).scalars().all()
+            if existing_outs:
+                primary_out = existing_outs[0]
+                primary_out.session_id = active_session.id if active_session else primary_out.session_id
+                primary_out.content = out_text
+                primary_out.language = final_state.get("outbound_language", "en")
+                for extra_out in existing_outs[1:]:
+                    await db.delete(extra_out)
+            else:
+                out_comm = Communication(
+                    id=uuid.uuid4(),
+                    user_id=current_user.user_id,
+                    role="patient",
+                    case_id=care_case.id,
+                    patient_id=care_case.patient_id,
+                    session_id=active_session.id if active_session else None,
+                    sender="ai_coordinator",
+                    channel=req.channel or "in_app_chat",
+                    language=final_state.get("outbound_language", "en"),
+                    content=out_text,
+                    acknowledged=True,
+                    sent_at=datetime.now(timezone.utc)
+                )
+                db.add(out_comm)
             await db.commit()
         except Exception as e:
             import logging
@@ -1964,6 +2089,16 @@ async def get_chat_history(
     comm_res = await db.execute(query)
     records = comm_res.scalars().all()
 
+    deduped_records = []
+    last_key = None
+    for r in records:
+        sender_norm = "ai" if (r.sender or "") in ("ai", "ai_coordinator", "ai_doctor_copilot") else (r.sender or "")
+        key = (sender_norm, (r.content or "").strip())
+        if key == last_key:
+            continue
+        last_key = key
+        deduped_records.append(r)
+
     messages = [
         ChatMessageHistoryItem(
             id=str(r.id),
@@ -1978,7 +2113,7 @@ async def get_chat_history(
             acknowledged=r.acknowledged,
             sent_at=r.sent_at
         )
-        for r in records
+        for r in deduped_records
     ]
 
     return ApiResponseEnvelope(

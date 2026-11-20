@@ -74,6 +74,27 @@ FEAR_PATTERNS = [
     r"\bخائف[ة]?\b", r"\bمرعوب[ة]?\b", r"\bهل\s+هو\s+سرطان\b", r"\bهل\s+سأموت\b",
 ]
 
+GREETING_PATTERNS = [
+    r"^\s*(hi|hello|hey|good\s+morning|good\s+afternoon|good\s+evening|greetings|hola|buenos\s+d[ií]as|buenas\s+tardes|مرحبا|أهلا|السلام\s+عليكم)(\s+there|\s+carebridge)?[!.,?\s]*$",
+]
+
+SCREENING_REQUEST_PATTERNS = [
+    r"\b(schedule|request|book|need|want|arrange|submit)\b.*\b(mammogram|screening|colonoscopy|cervical|pap\s+smear)\b",
+    r"\broutine\s+(mammogram|screening)\b",
+    r"\b(mammogram|screening)\b.*\b(schedule|request|intake|order)\b",
+    r"\bprogramar\b.*\b(mamograf[ií]a|detecci[oó]n|tamizaje)\b",
+    r"\bحجز\b.*\b(فحص|ماموجرام)\b",
+]
+
+CARE_JOURNEY_PATTERNS = [
+    r"\bwhere\s+am\s+i\s+in\s+my\s+care\s+(journey|pathway)\b",
+    r"\bmy\s+care\s+(journey|pathway|stage)\b",
+    r"\bwhat\s+happens\s+next\s+with\b",
+    r"\bwhat\s+is\s+my\s+(next\s+step|current\s+stage)\b",
+    r"\bd[oó]nde\s+estoy\s+en\s+mi\s+(proceso|camino)\b",
+    r"\bأين\s+أنا\s+في\s+رحلتي\b",
+]
+
 WEEKDAY_WORDS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "weekend", "weekday"]
 
 
@@ -280,6 +301,18 @@ class PatientBehaviourRouter:
         # B2 - transport request
         if _any(TRANSPORT_PATTERNS, text):
             return cls._handle_transport_request(db, pid, user_id, role, session_id, message, text, language)
+
+        # Patient screening intake request -> creates persisted coordinator task + notification
+        if _any(SCREENING_REQUEST_PATTERNS, text):
+            return cls._handle_screening_request(db, pid, case_id, message, language)
+
+        # Case-aware care journey & next steps inquiry
+        if _any(CARE_JOURNEY_PATTERNS, text):
+            return cls._handle_care_journey_inquiry(db, pid, case_id, language)
+
+        # Natural conversational greeting with real authorized case context
+        if _any(GREETING_PATTERNS, text):
+            return cls._handle_greeting(db, pid, case_id, language)
 
         return None
 
@@ -1069,6 +1102,279 @@ class PatientBehaviourRouter:
             tool_observations=obs,
             escalated=True,
             case_id=str(case.id) if case else None,
+        )
+
+    # ------------------------------------------------------------------
+    # Patient Screening Intake Request & Case-Aware Greeting
+    # ------------------------------------------------------------------
+    @classmethod
+    def _handle_screening_request(
+        cls, db: Session, patient_id: uuid.UUID, case_id, raw_message: str, language: str
+    ) -> BehaviourResult:
+        from app.models.event_audit import CaseEvent
+        from app.models.owner import CaseOwner
+        from app.models.user import User
+        from app.services.notification_service import NotificationService
+        from app.services.task_service import TaskService
+
+        case, doctor_name = cls._resolve_case_and_doctor(db, patient_id, case_id)
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        first_name = patient.first_name if patient else "there"
+        full_name = f"{patient.first_name} {patient.last_name}".strip() if patient else "Patient"
+
+        coord_owner = db.query(CaseOwner).filter(CaseOwner.role == "care_coordinator").first()
+        coord_name = coord_owner.name if coord_owner else "Priya Nair, RN"
+        facility_name = (coord_owner.facility if coord_owner and coord_owner.facility else None) or "Metropolitan Hospital Screening Center"
+
+        text_low = (raw_message or "").lower()
+        if "colonoscopy" in text_low:
+            screening_type = "Colonoscopy"
+        elif "cervical" in text_low or "pap" in text_low:
+            screening_type = "Cervical Screening"
+        else:
+            screening_type = "Mammogram"
+
+        obs: List[Dict[str, Any]] = []
+        if case:
+            ctx = dict(case.case_context or {})
+            ctx["screening_request"] = raw_message.strip()
+            ctx["onboarding_stage"] = "intake_submitted"
+            ctx["requested_screening_type"] = screening_type
+            case.case_context = ctx
+
+            task = TaskService.create_screening_handoff_task(
+                db=db,
+                case_id=case.id,
+                patient_id=patient_id,
+                screening_type=screening_type,
+                notes=raw_message.strip(),
+                idempotency_key=f"screening_req_{case.id}",
+            )
+            obs.append({
+                "tool": "create_screening_handoff_task",
+                "success": True,
+                "result": {"task_id": str(task.id), "screening_type": screening_type, "assigned_to": coord_name},
+            })
+
+            now = datetime.now(timezone.utc)
+            db.add(CaseEvent(
+                id=uuid.uuid4(),
+                case_id=case.id,
+                event_type="screening_request_submitted",
+                description=(
+                    f"Patient submitted {screening_type} screening request: '{raw_message.strip()}'. "
+                    f"Persisted task assigned to {coord_name}."
+                ),
+                event_data={
+                    "screening_type": screening_type,
+                    "request_text": raw_message.strip(),
+                    "task_id": str(task.id),
+                    "coordinator": coord_name,
+                },
+                timestamp=now,
+            ))
+
+            coord_users = db.query(User).filter(User.role == "care_coordinator", User.is_active.is_(True)).all()
+            notif_id = None
+            for cu in coord_users:
+                try:
+                    notif = NotificationService.stage_notification(
+                        db=db,
+                        user_id=cu.id,
+                        role="care_coordinator",
+                        event_type="screening_request_received",
+                        title=f"New Screening Request: {full_name}",
+                        message=(
+                            f"{full_name} ({case.case_number}) submitted a {screening_type} screening request: "
+                            f"\"{raw_message.strip()}\". Please create the screening order."
+                        ),
+                        priority="urgent",
+                        case_id=case.id,
+                        patient_id=patient_id,
+                        action_link=f"/cases/{case.id}",
+                        idempotency_key=f"notif_scr_req_{case.id}_{cu.id}",
+                        metadata_json={"task_id": str(task.id), "screening_type": screening_type},
+                    )
+                    notif_id = str(notif.id)
+                except Exception as exc:
+                    logger.warning(f"Screening request notification staging notice: {exc}")
+
+            db.commit()
+            try:
+                NotificationService.process_outbox_batch(db)
+            except Exception:
+                pass
+            if notif_id:
+                obs.append({
+                    "tool": "notify_coordinator_screening_request",
+                    "success": True,
+                    "result": {"notification_id": notif_id, "recipient": coord_name},
+                })
+
+        if language == "es":
+            reply = (
+                f"Gracias, {first_name}. He registrado su solicitud de {screening_type} y he creado una tarea prioritaria "
+                f"para su coordinadora de atención, {coord_name}, en {facility_name}.\n\n"
+                f"{coord_name} ha recibido una notificación para crear la orden de detección y registrar el procedimiento cuando se realice. "
+                "Le avisaré en cuanto la orden y el informe estén listos."
+            )
+        elif language == "ar":
+            reply = (
+                f"شكراً لكِ يا {first_name}. لقد سجلتُ طلب فحص ({screening_type}) وأنشأتُ مهمة لمنسقة الرعاية {coord_name} في {facility_name}.\n\n"
+                f"تم إرسال إشعار إلى {coord_name} لإنشاء طلب الفحص ومتابعة إجرائه. سأخبركِ فور تحديث حالة الفحص والتقرير."
+            )
+        else:
+            reply = (
+                f"Thank you, {first_name}. I have logged your {screening_type.lower()} screening request and created an urgent task "
+                f"for your Care Coordinator, {coord_name}, at {facility_name}.\n\n"
+                f"{coord_name} has been notified to create your screening order and track the procedure once it is performed. "
+                "Your Stage 1 screening milestone will update as soon as the procedure is completed, and I will be right here to explain your finalized report."
+            )
+
+        return BehaviourResult(
+            reply=reply,
+            intent="patient_intake_submitted",
+            tool_observations=obs,
+            case_id=str(case.id) if case else None,
+        )
+
+    @classmethod
+    def _handle_greeting(
+        cls, db: Session, patient_id: uuid.UUID, case_id, language: str
+    ) -> BehaviourResult:
+        from app.models.owner import CaseOwner
+        from app.services.lifecycle_service import LifecycleService
+
+        case, doctor_name = cls._resolve_case_and_doctor(db, patient_id, case_id)
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        first_name = patient.first_name if patient else "there"
+
+        coord_owner = db.query(CaseOwner).filter(CaseOwner.role == "care_coordinator").first()
+        coord_name = coord_owner.name if coord_owner else "Priya Nair, RN"
+
+        stage_summary = "at the start of your 14-stage care pathway"
+        if case:
+            stages = LifecycleService.get_lifecycle_stages(case)
+            completed = [s for s in stages if s.get("status") == "completed"]
+            if len(completed) == 0:
+                stage_summary = f"at the start of your 14-stage care pathway (Case {case.case_number})"
+            elif len(completed) == 14:
+                stage_summary = f"at 14 of 14 stages complete with full clinical closure (Case {case.case_number})"
+            else:
+                curr = LifecycleService.get_current_stage(case)
+                stage_summary = (
+                    f"at Stage {curr.get('stage_number', len(completed) + 1)} of 14 — "
+                    f"{curr.get('title', 'Active Care Coordination')} (Case {case.case_number})"
+                )
+
+        if language == "es":
+            reply = (
+                f"Hola {first_name}, me alegra saludarle. Actualmente se encuentra {stage_summary}, "
+                f"con el apoyo de {coord_name} y {doctor_name}. "
+                "¿Le gustaría solicitar una prueba de detección, revisar su informe o consultar sobre su próxima cita?"
+            )
+        elif language == "ar":
+            reply = (
+                f"مرحباً {first_name}، يسعدني تواصلكِ. أنتِ حالياً في {stage_summary} بدعم من {coord_name} و{doctor_name}. "
+                "هل تودين تقديم طلب فحص، أو شرح تقريركِ الطبي، أو الاستفسار عن موعدكِ القادم؟"
+            )
+        else:
+            reply = (
+                f"Hello {first_name}! You are currently {stage_summary}, supported by Care Coordinator {coord_name} and {doctor_name}. "
+                "How can I help you today—would you like to submit a screening request, go over your report in plain language, or check on your appointment and transport?"
+            )
+
+        return BehaviourResult(
+            reply=reply,
+            intent="greeting",
+            case_id=str(case.id) if case else None,
+        )
+
+    @classmethod
+    def _handle_care_journey_inquiry(
+        cls, db: Session, patient_id: uuid.UUID, case_id, language: str
+    ) -> BehaviourResult:
+        from app.models.appointment import Appointment
+        from app.models.owner import CaseOwner
+        from app.services.lifecycle_service import LifecycleService
+
+        case, doctor_name = cls._resolve_case_and_doctor(db, patient_id, case_id)
+        patient = db.query(Patient).filter(Patient.id == patient_id).first()
+        first_name = patient.first_name if patient else "there"
+
+        coord_owner = db.query(CaseOwner).filter(CaseOwner.role == "care_coordinator").first()
+        coord_name = coord_owner.name if coord_owner else "Priya Nair, RN"
+
+        if not case:
+            return BehaviourResult(
+                reply=f"Hello {first_name}, I do not see an active care case on your profile yet. Would you like me to help you request a screening?",
+                intent="care_journey_status",
+            )
+
+        stages = LifecycleService.get_lifecycle_stages(case)
+        completed = [s for s in stages if s.get("status") == "completed"]
+        completed_count = len(completed)
+        curr = LifecycleService.get_current_stage(case)
+        curr_title = curr.get("title", "Attending Physician Clinical Review")
+        curr_num = curr.get("stage_number", completed_count + 1)
+
+        sr = case.screening_result
+        finding_code = sr.finding_code if sr and sr.finding_code else "INTAKE-PENDING"
+        modality = sr.screening_type if sr and sr.screening_type else "Mammogram"
+
+        appt = (
+            db.query(Appointment)
+            .filter(
+                Appointment.case_id == case.id,
+                Appointment.status.in_(("CONFIRMED", "confirmed", "booked", "PROPOSED")),
+            )
+            .order_by(Appointment.scheduled_time.desc())
+            .first()
+        )
+        appt_line = ""
+        if appt and appt.scheduled_time:
+            appt_line = f" Your next scheduled visit is on {_utc(appt.scheduled_time).strftime('%B %d at %H:%M UTC')} at {appt.facility} ({appt.status})."
+
+        obs = [{
+            "tool": "get_care_journey_context",
+            "success": True,
+            "result": {
+                "case_number": case.case_number,
+                "completed_stages": completed_count,
+                "current_stage": curr_num,
+                "finding_code": finding_code,
+                "doctor": doctor_name,
+                "coordinator": coord_name,
+            },
+        }]
+
+        if language == "es":
+            reply = (
+                f"{first_name}, en su caso **{case.case_number}** ha completado **{completed_count} de las 14 etapas** "
+                f"(informe de {modality} finalizado con resultado **{finding_code}**) y ahora se encuentra en la **Etapa {curr_num}: {curr_title}**.\n\n"
+                f"El siguiente paso es que **{doctor_name}** revise sus hallazgos diagnósticos y autorice la referencia con el especialista, "
+                f"mientras su coordinadora **{coord_name}** prepara su cita.{appt_line} ¿Desea que revisemos preguntas para su consulta o necesita ayuda con el transporte?"
+            )
+        elif language == "ar":
+            reply = (
+                f"يا {first_name}، في ملفكِ الطبي (**{case.case_number}**) تم إكمال **{completed_count} من أصل 14 مرحلة** "
+                f"(تقرير {modality} المعتمد بنتيجة **{finding_code}**) وأنتِ الآن في **المرحلة {curr_num}: {curr_title}**.\n\n"
+                f"الخطوة التالية هي مراجعة **{doctor_name}** لنتائج التقرير واعتماد الإحالة التخصصية، بينما تتابع منسقة الرعاية **{coord_name}** ترتيب موعدكِ.{appt_line}"
+            )
+        else:
+            reply = (
+                f"Hello {first_name}! For your care pathway (**{case.case_number}**), you have completed **{completed_count} of 14 stages** "
+                f"(including your finalized {modality} report showing **{finding_code}**) and you are currently at **Stage {curr_num} of 14: {curr_title}**.\n\n"
+                f"Next, **{doctor_name}** will review your finalized findings, record the clinical decision, and accept your specialist referral, "
+                f"while Care Coordinator **{coord_name}** prepares your specialist consultation options.\n\n"
+                "Would you like help preparing questions for Dr. Arjun Menon or requesting a pickup ride once your visit time is selected?"
+            )
+
+        return BehaviourResult(
+            reply=reply,
+            intent="care_journey_status",
+            tool_observations=obs,
+            case_id=str(case.id),
         )
 
     # ------------------------------------------------------------------

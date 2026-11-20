@@ -1,0 +1,84 @@
+{
+  "steps": {
+    "Step 1": {
+      "title": "Patient logs in and views screening results",
+      "status": "PASS",
+      "endpoint": "POST /api/v1/auth/login, GET /api/v1/cases",
+      "database_evidence": "Patient Meenakshi Ramanathan-F81AF6 (ID: 25500627-4565-4a1f-93a2-64f4c3c69a90) authenticated. Viewed Case #CASE-SYN-F81AF6 (Type: Mammogram, Code: BI-RADS-4, Summary: '4.2cm irregular mass with clustered microcalcifica...').",
+      "error": null
+    },
+    "Step 2": {
+      "title": "Patient asks AI assistant natural language & follow-up questions",
+      "status": "PASS",
+      "endpoint": "POST /api/v1/agent/interact",
+      "database_evidence": "Turn 1 Intent: 'patient_inquiry', Emotion: 'anxious', AI Response preview: 'I hear you, Meenakshi Ramanathan-F81AF6, and it is completel...'. Turn 2 Conversational Follow-up: 'I hear you, Meenakshi Ramanathan-F81AF6, and it is completel...' (Actions executed: 2).",
+      "error": null
+    },
+    "Step 3": {
+      "title": "AI interprets request & uses appropriate available tools",
+      "status": "PASS",
+      "endpoint": "POST /api/v1/agent/interact",
+      "database_evidence": "Stateful cognitive evaluation: primary_intent=patient_inquiry, emotion=anxious, actions_executed=2",
+      "error": null
+    },
+    "Step 4": {
+      "title": "Care case is created/updated correctly",
+      "status": "PASS",
+      "endpoint": "GET /api/v1/cases/f5394e43-1f7e-49f5-892c-457388acd9d5",
+      "database_evidence": "Case #CASE-SYN-F81AF6 verified in PostgreSQL (Status: result_received, Priority: urgent, Linked Events: 2).",
+      "error": null
+    },
+    "Step 5": {
+      "title": "Referral creation & coordinator assignment",
+      "status": "PASS",
+      "endpoint": "POST ToolRegistry.create_referral_request, GET /api/v1/referrals",
+      "database_evidence": "Referral ID b1888494-b51e-44b8-a6e5-ec0c8b766efd created for Breast Oncology at Metropolitan Breast Oncology Center. Status: sent, SLA Deadline: 2026-11-21T20:58:23.630674+05:30. Assigned to Coordinator Priya Nair with tracking Task and CaseEvent.",
+      "error": null
+    },
+    "Step 6": {
+      "title": "Appointment coordination between patient & care team",
+      "status": "PASS",
+      "endpoint": "POST /api/v1/appointments/book",
+      "database_evidence": "Appointment f5743944-45ca-4684-a841-f8cc39c406c7 booked on active case (status='scheduled'). Closed case booking rejected with HTTP 400. Authorized doctor reopening and subsequent booking verified.",
+      "error": null
+    },
+    "Step 7": {
+      "title": "Appointment confirmation & notification workflows",
+      "status": "PASS",
+      "endpoint": "GET /api/v1/appointments",
+      "database_evidence": "Appointment confirmed in patient portal (visible to Patient). Case timeline event 'appointment_booked' persisted in PostgreSQL.",
+      "error": null
+    },
+    "Step 8": {
+      "title": "Missed/cancelled appointment follow-up & recovery",
+      "status": "PASS",
+      "endpoint": "POST /api/v1/appointments/{id}/cancel, GET /api/v1/recovery",
+      "database_evidence": "Appointment cancelled with documented barrier. Case transitioned to 'recovering'. Task #87a7e182-8fe7-4ae0-9934-10f43494c38d ('Rebook cancelled appointment for CASE-SYN-F81AF6') assigned to Care Coordinator. Case surfaced in /api/v1/recovery queue.",
+      "error": null
+    },
+    "Step 9": {
+      "title": "Clinical concerns create escalation assigned to doctor",
+      "status": "PASS",
+      "endpoint": "POST /api/v1/agent/interact",
+      "database_evidence": "Acute symptom trigger detected: primary_intent='urgent_clinical_escalation'. Case status transitioned to 'ESCALATED' with priority 'critical'. Escalation logged in audit timeline with rate-limit fallback resilience.",
+      "error": null
+    },
+    "Step 10": {
+      "title": "Doctor reviews, responds & resolves escalation",
+      "status": "PASS",
+      "endpoint": "POST /api/v1/agent/interact (Doctor Subgraph)",
+      "database_evidence": "Doctor Aris Thorne evaluated escalation via Doctor Subgraph. Level 3 physician decision recorded in audit log. Case transitioned from 'ESCALATED' to 'consulted'.",
+      "error": null
+    },
+    "Step 11": {
+      "title": "Care closure requires evidence & authorized clinical approval",
+      "status": "PASS",
+      "endpoint": "ToolRegistry.request_closure_verification & ToolRegistry.retrieve_closure_evidence",
+      "database_evidence": "Case #f5394e43-1f7e-49f5-892c-457388acd9d5 formally closed. Level 3 closure evidence #914e97ea-e461-46e8-9fe1-712f7f15e77c signed off by Dr. Aris Thorne. 5-point checklist verified in PostgreSQL (clinical_verification_signed=True, closure_evidence_recorded=True).",
+      "error": null
+    }
+  },
+  "passed": 11,
+  "failed": 0,
+  "not_implemented": 0
+}

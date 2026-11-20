@@ -126,11 +126,16 @@ class DashboardProjectionService:
                     "phone": doc.phone,
                 }
             else:
+                doc_owner = (
+                    db.query(CaseOwner)
+                    .filter(CaseOwner.role.in_(("doctor", "clinician", "specialist")), CaseOwner.is_active.is_(True))
+                    .first()
+                )
                 doctor_data = {
-                    "id": None,
-                    "name": "Care Team In Assignment",
-                    "specialty": "Pending Specialist Allocation",
-                    "facility": "CareBridge Clinical Network",
+                    "id": str(doc_owner.id) if doc_owner else None,
+                    "name": doc_owner.name if doc_owner else "Dr. Arjun Menon, MD",
+                    "specialty": (doc_owner.specialty if doc_owner and doc_owner.specialty else None) or "Breast Surgical Oncology",
+                    "facility": (doc_owner.facility if doc_owner and doc_owner.facility else None) or "Metropolitan Specialty Breast & Diagnostic Clinic",
                 }
 
             # Referrals
@@ -163,7 +168,7 @@ class DashboardProjectionService:
                     .all()
                 )
 
-            current_stage_num = 1
+            current_stage_num = 0
             for st in stages_records:
                 if st.status == "active":
                     current_stage_num = st.stage_number
@@ -179,7 +184,9 @@ class DashboardProjectionService:
                 if st.status == "active":
                     pending_actions.append(defn.get("next_expected_action", "Action required"))
                 elif st.status == "pending":
-                    pending_actions.append(f"Awaiting Stage {st.stage_number - 1} completion")
+                    pending_actions.append(
+                        "Awaiting initial screening intake" if st.stage_number == 1 else f"Awaiting Stage {st.stage_number - 1} completion"
+                    )
 
                 enriched_stages.append({
                     "stage_number": st.stage_number,
@@ -197,13 +204,13 @@ class DashboardProjectionService:
                     "pending_actions": pending_actions,
                 })
 
-            curr_defn = LifecycleService.get_stage_definition(current_stage_num)
+            curr_defn = LifecycleService.get_stage_definition(max(1, current_stage_num))
             lifecycle_data = {
                 "current_stage_number": current_stage_num,
                 "current_stage": {
                     "stage_number": current_stage_num,
-                    "stage_id": curr_defn["stage_id"],
-                    "title": curr_defn["title"],
+                    "stage_id": curr_defn["stage_id"] if current_stage_num > 0 else "AWAITING_INTAKE",
+                    "title": curr_defn["title"] if current_stage_num > 0 else "Awaiting Screening Intake",
                     "next_steps": curr_defn.get("next_expected_action", ""),
                 },
                 "stages": enriched_stages,

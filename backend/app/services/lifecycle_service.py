@@ -715,12 +715,15 @@ class LifecycleService:
                     next_stage_id = s["stage_id"]
                     break
 
+        import copy
+        from sqlalchemy.orm.attributes import flag_modified
         ctx = dict(case.case_context or {})
-        ctx["lifecycle_stages"] = stages
+        ctx["lifecycle_stages"] = copy.deepcopy(stages)
         ctx["current_stage_number"] = next_num if next_num <= 14 else 14
         ctx["current_stage_id"] = next_stage_id or "VERIFIED_CLINICAL_CLOSURE"
         ctx["last_updated_at"] = now.isoformat()
         case.case_context = ctx
+        flag_modified(case, "case_context")
 
         # 3. Synchronize case.status with journey progress
         status_map = {
@@ -869,17 +872,6 @@ class LifecycleService:
         ctx["clinical_review"] = review_record
         case.case_context = ctx
         db.commit()
-
-        # Complete Stage 4: PATIENT_UNDERSTANDS (AI Case-Aware Conversation)
-        cls.advance_stage(
-            db=db,
-            case_id=case.id,
-            stage_ident=4,
-            actor_role="ai_agent",
-            actor_id="supervisor_agent",
-            evidence={"patient_understanding_established": True},
-            notes="Patient completed AI case-aware conversation; clinical review ordered."
-        )
 
         # Complete Stage 5: CLINICAL_REVIEW
         cls.advance_stage(
@@ -1032,7 +1024,7 @@ class LifecycleService:
         # Mark active appointment as attended
         appt = db.query(Appointment).filter(
             Appointment.case_id == case.id,
-            Appointment.status.in_(["booked", "confirmed"])
+            Appointment.status.in_(["booked", "confirmed", "CONFIRMED"])
         ).first()
         if appt:
             appt.status = "attended"
@@ -1260,16 +1252,18 @@ class LifecycleService:
             Task.task_type.in_(["clinical_review", "referral_routing"])
         ).count()
 
+        events_count = db.query(CaseEvent).filter(CaseEvent.case_id == case.id).count()
+
         checklist = {
             "screening_result_documented": sr is not None,
             "clinical_review_completed": cr is not None and bool(cr.get("clinical_assessment")),
             "care_pathway_authorized": cr is not None and bool(cr.get("approved_pathway")),
-            "referral_outcome_documented": len(case.referrals) > 0 and any(r.status in ("accepted", "completed") for r in case.referrals),
-            "appointment_attendance_verified": any(a.status in ("attended", "completed", "confirmed") for a in case.appointments),
+            "referral_outcome_documented": len(case.referrals) > 0 and any((r.status or "").lower() in ("accepted", "completed") for r in case.referrals),
+            "appointment_attendance_verified": any((a.status or "").lower() in ("attended", "completed", "confirmed") for a in case.appointments),
             "consultation_outcome_documented": co is not None and bool(co.get("biopsy_pathology_outcome")),
             "treatment_disposition_recorded": (co is not None and bool(co.get("treatment_plan"))) or (ctx.get("treatment_monitoring", {}).get("treatment_plan") is not None),
-            "follow_up_resolved": fu is not None and fu.get("status") in ("attended", "completed", "resolved", "scheduled"),
-            "supporting_evidence_available": True,
+            "follow_up_resolved": fu is not None and (fu.get("status") or "").lower() in ("attended", "completed", "resolved", "scheduled"),
+            "supporting_evidence_available": events_count > 0,
             "no_unresolved_clinical_tasks": pending_mandatory_tasks == 0
         }
 

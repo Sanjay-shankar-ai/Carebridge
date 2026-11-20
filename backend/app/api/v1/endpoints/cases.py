@@ -110,6 +110,52 @@ async def get_case_detail(
     )
 
 
+@router.get("/{case_id}/events", response_model=ApiResponseEnvelope[List[Dict[str, Any]]], summary="Get Case Timeline Events")
+async def get_case_timeline_events(
+    case_id: uuid.UUID,
+    current_user: UserPrincipal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """Retrieves persisted chronological CaseEvent audit records for a care case."""
+    case_stmt = select(CareCase).where(CareCase.id == case_id)
+    case_res = await db.execute(case_stmt)
+    care_case = case_res.scalar_one_or_none()
+    if not care_case:
+        raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+
+    if current_user.role == "patient":
+        if not current_user.patient_id or str(care_case.patient_id) != str(current_user.patient_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: You do not have permission to view another patient's case timeline."
+            )
+
+    ev_stmt = (
+        select(CaseEvent)
+        .where(CaseEvent.case_id == case_id)
+        .order_by(CaseEvent.timestamp.desc())
+    )
+    ev_res = await db.execute(ev_stmt)
+    events = ev_res.scalars().all()
+
+    data = [
+        {
+            "event_id": str(e.id),
+            "case_id": str(e.case_id),
+            "event_type": e.event_type,
+            "description": e.description,
+            "event_data": e.event_data or {},
+            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+        }
+        for e in events
+    ]
+    return ApiResponseEnvelope(
+        success=True,
+        message=f"Retrieved {len(data)} timeline events for case #{care_case.case_number}",
+        data=data,
+    )
+
+
 @router.get("/{case_id}/unified-context", response_model=ApiResponseEnvelope[Dict[str, Any]], summary="Get Unified Care Context")
 async def get_case_unified_context(
     case_id: uuid.UUID,
@@ -578,16 +624,34 @@ async def schedule_screening(
         )
         db.add(appt)
 
-    # Advance Case Status
+    # Advance Case Status (Order created / scheduled — Stage 1 remains PENDING until screening is performed)
     care_case.status = "screening_scheduled"
-    ctx = care_case.case_context or {}
+    ctx = dict(care_case.case_context or {})
     ctx.update({
         "onboarding_stage": "screening_scheduled",
+        "screening_order_id": f"ORD-SCR-{str(care_case.id)[:8].upper()}",
+        "screening_order_status": "ORDERED",
         "screening_scheduled_at": req.scheduled_time.isoformat(),
         "screening_facility": facility,
         "screening_provider": provider_name
     })
     care_case.case_context = ctx
+
+    # Resolve pending schedule_screening task with order creation evidence
+    task_stmt = select(Task).where(
+        Task.case_id == care_case.id,
+        Task.task_type == "schedule_screening",
+        Task.status.in_(["pending", "in_progress", "overdue"])
+    )
+    for t_row in (await db.execute(task_stmt)).scalars().all():
+        t_row.status = "completed"
+        t_row.completed_at = now
+        t_row.completion_evidence = {
+            "order_created": True,
+            "scheduled_time": req.scheduled_time.isoformat(),
+            "facility": facility,
+            "completed_by": getattr(current_user, "name", "Priya Nair, RN")
+        }
 
     # Record Case Event
     event = CaseEvent(
@@ -687,13 +751,29 @@ async def complete_screening(
 
     # Advance Case Status
     care_case.status = "screening_completed"
-    ctx = care_case.case_context or {}
+    ctx = dict(care_case.case_context or {})
     ctx.update({
         "onboarding_stage": "screening_completed",
+        "screening_order_status": "PERFORMED",
         "screening_completed_at": completed_time.isoformat(),
         "completion_notes": req.completion_notes
     })
     care_case.case_context = ctx
+
+    # Ensure any schedule_screening task is marked completed before advancing Stage 1
+    task_stmt = select(Task).where(
+        Task.case_id == care_case.id,
+        Task.task_type == "schedule_screening",
+        Task.status.in_(["pending", "in_progress", "overdue"])
+    )
+    for t_row in (await db.execute(task_stmt)).scalars().all():
+        t_row.status = "completed"
+        t_row.completed_at = now
+        t_row.completion_evidence = {
+            "screening_performed": True,
+            "completed_at": completed_time.isoformat(),
+            "facility": facility
+        }
 
     # Record Case Event
     event = CaseEvent(
@@ -709,6 +789,7 @@ async def complete_screening(
         timestamp=now
     )
     db.add(event)
+    await db.commit()
 
     # Dispatch notification to patient & advance Stage 1 in lifecycle
     try:
@@ -723,7 +804,7 @@ async def complete_screening(
                 facility=facility,
                 patient_name=p_name
             )
-            # Advance Stage 1 (SCREENING) with verified operational evidence
+            # Advance Stage 1 (SCREENING_PERFORMED) with verified operational evidence
             try:
                 LifecycleService.advance_stage(
                     db=sync_db,
@@ -731,7 +812,10 @@ async def complete_screening(
                     stage_ident=1,
                     actor_role="care_coordinator",
                     actor_id=str(current_user.user_id),
+                    actor_name=getattr(current_user, "name", "Priya Nair, RN"),
                     evidence={
+                        "screening_performed": True,
+                        "order_status": "PERFORMED",
                         "facility": facility,
                         "completed_at": completed_time.isoformat(),
                         "completion_notes": req.completion_notes,
@@ -745,7 +829,7 @@ async def complete_screening(
         import logging
         logging.getLogger("carebridge.cases").warning(f"Notification complete notice: {notif_err}")
 
-    await db.commit()
+    await db.refresh(care_case)
 
     return ApiResponseEnvelope.success_response(
         data={
@@ -1435,14 +1519,17 @@ async def finalize_report(
         )
 
     # 1. Update or create ScreeningResult record
+    screening_type_label = "Mammogram"
     if care_case.screening_result:
         sr = care_case.screening_result
+        screening_type_label = sr.screening_type or "Mammogram"
         sr.finding_code = finding_code
         sr.finding_summary = finding_summary
         sr.test_date = now
-        sr_raw = sr.raw_report_data or {}
+        sr_raw = dict(sr.raw_report_data or {})
         sr_raw.update({
             "filename": filename,
+            "report_text": finding_summary,
             "recommendation": recommendation,
             "finalized_by": getattr(current_user, "name", "Priya Nair, RN"),
             "finalized_at": now.isoformat(),
@@ -1461,6 +1548,7 @@ async def finalize_report(
             performing_facility=care_case.current_owner.facility if care_case.current_owner else "Metropolitan Screening Center",
             raw_report_data={
                 "filename": filename,
+                "report_text": finding_summary,
                 "recommendation": recommendation,
                 "finalized_by": getattr(current_user, "name", "Priya Nair, RN"),
                 "finalized_at": now.isoformat(),
@@ -1471,7 +1559,17 @@ async def finalize_report(
         await db.flush()
         care_case.screening_result_id = sr.id
 
-    # 2. Advance Stage 2 via LifecycleService
+    report_status = "FINALIZED"
+    if req.requires_doctor_review:
+        report_status = "REQUIRES_REVIEW"
+        care_case.status = "requires_review"
+
+    ctx = dict(care_case.case_context or {})
+    ctx["report_status"] = report_status
+    care_case.case_context = ctx
+    await db.commit()
+
+    # 2. Advance Stage 2 (RESULT_FINALIZED) & Stage 3 (RESULT_DELIVERED + Patient Notification) via LifecycleService
     with get_sync_db() as sync_db:
         LifecycleService.advance_stage(
             db=sync_db,
@@ -1490,15 +1588,28 @@ async def finalize_report(
                 "finalized_at": now.isoformat()
             }
         )
+        LifecycleService.advance_stage(
+            db=sync_db,
+            case_id=care_case.id,
+            stage_ident=3,
+            actor_role="care_coordinator",
+            actor_id=str(current_user.user_id),
+            actor_name=getattr(current_user, "name", "Priya Nair, RN"),
+            evidence={
+                "notification_channel": "in_app_portal",
+                "delivered": True,
+                "report_filename": filename,
+                "finding_code": finding_code
+            },
+            notes=f"Finalized report ({finding_code}) delivered to patient portal with notification.",
+            patient_notification_title=f"Diagnostic Report Finalized: {finding_code}",
+            patient_notification_message=(
+                f"Your {screening_type_label} "
+                f"report ({finding_code}) has been validated and finalized. Open CareBridge AI to review your plain-language explanation."
+            )
+        )
 
-    report_status = "FINALIZED"
-    if req.requires_doctor_review:
-        report_status = "REQUIRES_REVIEW"
-        care_case.status = "requires_review"
-
-    ctx["report_status"] = report_status
-    care_case.case_context = ctx
-    await db.commit()
+    await db.refresh(care_case)
 
     return ApiResponseEnvelope(
         success=True,
