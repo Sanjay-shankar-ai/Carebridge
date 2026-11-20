@@ -56,5 +56,17 @@ class Referral(Base, TimestampedUUIDMixin):
     # Relationships
     care_case: Mapped["CareCase"] = relationship("CareCase", back_populates="referrals")
 
+    @property
+    def referral_number(self) -> str:
+        return f"REF-{str(self.id)[:8].upper()}"
+
+    @property
+    def receiving_facility(self) -> str:
+        return self.target_facility
+
+    @receiving_facility.setter
+    def receiving_facility(self, value: str) -> None:
+        self.target_facility = value
+
     def __repr__(self) -> str:
         return f"<Referral to {self.target_facility} ({self.status})>"

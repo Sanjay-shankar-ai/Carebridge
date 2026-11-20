@@ -13,13 +13,21 @@ from app.database.session import Base, TimestampedUUIDMixin
 
 
 class ConversationSession(Base, TimestampedUUIDMixin):
-    """Encapsulates persistent conversation memory and commitments across patient touchpoints."""
+    """Encapsulates persistent conversation memory and commitments across patient/clinician touchpoints."""
     __tablename__ = "conversation_sessions"
 
-    patient_id: Mapped[uuid.UUID] = mapped_column(
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True
+    )
+    role: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    patient_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("patients.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True
     )
     case_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -39,27 +47,35 @@ class ConversationSession(Base, TimestampedUUIDMixin):
     )
 
     # Relationships
-    patient: Mapped["Patient"] = relationship("Patient", back_populates="conversation_sessions")
+    patient: Mapped[Optional["Patient"]] = relationship("Patient", back_populates="conversation_sessions")
+    user: Mapped[Optional["User"]] = relationship("User")
     communications: Mapped[List["Communication"]] = relationship("Communication", back_populates="session", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
-        return f"<ConversationSession {self.id} for Patient {self.patient_id} (Active: {self.is_active})>"
+        return f"<ConversationSession {self.id} for User {self.user_id} Role {self.role} (Active: {self.is_active})>"
 
 
 class Communication(Base, TimestampedUUIDMixin):
-    """FHIR-aligned Communication Model capturing patient exchanges and comprehension loops."""
+    """FHIR-aligned Communication Model capturing patient/clinician exchanges and comprehension loops."""
     __tablename__ = "communications"
 
-    case_id: Mapped[uuid.UUID] = mapped_column(
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("care_cases.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
         index=True
     )
-    patient_id: Mapped[uuid.UUID] = mapped_column(
+    role: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    case_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("care_cases.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True
+    )
+    patient_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("patients.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True
     )
     session_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -68,9 +84,9 @@ class Communication(Base, TimestampedUUIDMixin):
         nullable=True,
         index=True
     )
-    sender: Mapped[str] = mapped_column(String(32), nullable=False) # "ai_coordinator", "patient", "human_coordinator"
-    channel: Mapped[str] = mapped_column(String(32), default="sms") # "sms", "whatsapp", "in_app_chat"
-    language: Mapped[str] = mapped_column(String(16), default="en") # "en", "ta", "mixed"
+    sender: Mapped[str] = mapped_column(String(32), nullable=False) # "ai_coordinator", "patient", "human_coordinator", "doctor", "clinician"
+    channel: Mapped[str] = mapped_column(String(32), default="in_app_chat") # "sms", "whatsapp", "in_app_chat"
+    language: Mapped[str] = mapped_column(String(16), default="en") # "en", "ta", "es", "ar"
     content: Mapped[str] = mapped_column(Text, nullable=False)
     translated_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     
@@ -83,8 +99,8 @@ class Communication(Base, TimestampedUUIDMixin):
     )
 
     # Relationships
-    care_case: Mapped["CareCase"] = relationship("CareCase", back_populates="communications")
-    patient: Mapped["Patient"] = relationship("Patient", back_populates="communications")
+    care_case: Mapped[Optional["CareCase"]] = relationship("CareCase", back_populates="communications")
+    patient: Mapped[Optional["Patient"]] = relationship("Patient", back_populates="communications")
     session: Mapped[Optional["ConversationSession"]] = relationship("ConversationSession", back_populates="communications")
 
     def __repr__(self) -> str:

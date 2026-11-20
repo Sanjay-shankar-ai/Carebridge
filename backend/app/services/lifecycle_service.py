@@ -470,6 +470,8 @@ class LifecycleService:
                         existing_row.status = st["status"]
                         if st.get("completed_at"):
                             existing_row.completed_at = datetime.fromisoformat(st["completed_at"])
+                db.flush()
+                db.commit()
             except Exception as e:
                 logger.warning(f"Error persisting relational case_lifecycle_stages in initialize_lifecycle: {e}")
 

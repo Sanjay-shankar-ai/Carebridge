@@ -96,5 +96,17 @@ class Notification(Base, TimestampedUUIDMixin):
     care_case: Mapped[Optional["CareCase"]] = relationship("CareCase", foreign_keys=[case_id])
     patient: Mapped[Optional["Patient"]] = relationship("Patient", foreign_keys=[patient_id])
 
+    @property
+    def channel(self) -> str:
+        if isinstance(self.metadata_json, dict):
+            return self.metadata_json.get("channel", "in_app")
+        return "in_app"
+
+    @channel.setter
+    def channel(self, val: str) -> None:
+        if not isinstance(self.metadata_json, dict):
+            self.metadata_json = {}
+        self.metadata_json["channel"] = val
+
     def __repr__(self) -> str:
         return f"<Notification {self.id} for User {self.user_id} ({self.event_type}) is_read={self.is_read}>"

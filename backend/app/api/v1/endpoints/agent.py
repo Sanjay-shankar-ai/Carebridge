@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, or_, and_, delete
 from sqlalchemy.orm import selectinload
 
 from app.database.session import get_async_db
@@ -21,6 +21,8 @@ from app.models.appointment import Appointment
 from app.models.owner import CaseOwner
 from app.agents.graph import supervisor_graph
 from app.workflows.doctor_workflow import run_doctor_workflow
+from app.agents.cognitive_engine import CognitiveEngine
+from app.tools.registry import ToolRegistry
 from app.core.security import get_current_user, UserPrincipal
 from app.core.rate_limiter import rate_limit_agent
 from app.schemas.common import ApiResponseEnvelope
@@ -30,6 +32,7 @@ router = APIRouter(prefix="/agent", tags=["AI Supervisor Agent"])
 
 class PatientInteractionRequest(BaseModel):
     case_id: Optional[uuid.UUID] = Field(default=None, description="UUID of the active care case (optional for doctors)")
+    session_id: Optional[uuid.UUID] = Field(default=None, description="UUID of existing conversation session")
     message: str = Field(min_length=1, max_length=10000, description="Natural language message from patient or provider")
     channel: str = Field(default="in_app_chat", description="'in_app_chat', 'sms', 'whatsapp'")
     sender: Optional[str] = Field(default=None, description="Reported sender (overridden by authenticated role)")
@@ -38,6 +41,7 @@ class PatientInteractionRequest(BaseModel):
 class AgentExecutionResponse(BaseModel):
     case_id: str
     patient_id: str
+    session_id: Optional[str] = None
     primary_intent: str
     emotional_state: str
     detected_barriers: list
@@ -71,7 +75,10 @@ class ChatHistoryResponse(BaseModel):
 
 class ConversationSessionResponse(BaseModel):
     id: str
-    patient_id: str
+    user_id: Optional[str] = None
+    role: Optional[str] = None
+    title: Optional[str] = "New Chat"
+    patient_id: Optional[str] = None
     case_id: Optional[str] = None
     channel: str
     summary: Optional[str] = None
@@ -83,8 +90,14 @@ class ConversationSessionResponse(BaseModel):
 
 
 class CreateSessionRequest(BaseModel):
+    title: Optional[str] = None
     case_id: Optional[uuid.UUID] = None
+    patient_id: Optional[uuid.UUID] = None
     channel: str = "in_app_chat"
+
+
+class RenameSessionRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=255, description="New title for the conversation")
 
 
 @router.post("/interact", response_model=ApiResponseEnvelope[AgentExecutionResponse], dependencies=[Depends(rate_limit_agent)], summary="Interact with CareBridge AI Brain")
@@ -99,6 +112,51 @@ async def interact_with_agent(
     and strictly isolates conversational state threads per user session.
     """
     user_role = current_user.role.lower()
+
+    # -------------------------------------------------------------------------
+    # Resolve or initialize active ConversationSession (Issue 1 Isolation)
+    # -------------------------------------------------------------------------
+    now = datetime.now(timezone.utc)
+    user_uuid = uuid.UUID(str(current_user.user_id))
+    active_session: Optional[ConversationSession] = None
+    if req.session_id:
+        sess_stmt = select(ConversationSession).where(ConversationSession.id == req.session_id)
+        sess_res = await db.execute(sess_stmt)
+        active_session = sess_res.scalar_one_or_none()
+        if not active_session:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Session {req.session_id} not found.")
+
+        is_owner = (str(active_session.user_id) == str(current_user.user_id)) or (
+            user_role == "patient" and current_user.patient_id and str(active_session.patient_id) == str(current_user.patient_id)
+        )
+        if not is_owner:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: You cannot access another user's conversation session."
+            )
+        active_session.last_interaction_at = now
+    else:
+        first_line = req.message.strip().split("\n")[0][:40]
+        title = (first_line + "...") if len(first_line) == 40 else first_line
+        patient_uuid = None
+        if user_role == "patient" and current_user.patient_id:
+            try:
+                patient_uuid = uuid.UUID(current_user.patient_id)
+            except ValueError:
+                pass
+        active_session = ConversationSession(
+            id=uuid.uuid4(),
+            user_id=user_uuid,
+            role=user_role,
+            title=title or "New Chat",
+            case_id=req.case_id,
+            patient_id=patient_uuid,
+            channel=req.channel or "in_app_chat",
+            is_active=True,
+            last_interaction_at=now
+        )
+        db.add(active_session)
+        await db.flush()
 
     # =========================================================================
     # Branch 1: Doctor / Clinician / Specialist Interaction
@@ -117,6 +175,7 @@ async def interact_with_agent(
         response_data = AgentExecutionResponse(
             case_id=case_id_str or (doc_result.get("case_id") or ""),
             patient_id=doc_result.get("patient_id") or "",
+            session_id=str(active_session.id),
             primary_intent=doc_result.get("doctor_intent") or "general_query",
             emotional_state="clinical_objective",
             detected_barriers=[],
@@ -127,52 +186,52 @@ async def interact_with_agent(
             approval_request=None,
         )
 
-        # Phase 1: Persist doctor query and copilot reply in communications table
+        # Persist doctor query and copilot reply in communications table
         try:
             target_cid = None
+            doc_patient_id = None
             if case_id_str:
                 try:
                     target_cid = uuid.UUID(case_id_str)
-                except ValueError:
-                    pass
-            elif doc_result.get("case_id"):
-                try:
-                    target_cid = uuid.UUID(doc_result.get("case_id"))
+                    case_stmt = select(CareCase).where(CareCase.id == target_cid)
+                    c_res = await db.execute(case_stmt)
+                    doc_cc = c_res.scalar_one_or_none()
+                    if doc_cc:
+                        doc_patient_id = doc_cc.patient_id
                 except ValueError:
                     pass
 
-            if target_cid:
-                case_stmt = select(CareCase).where(CareCase.id == target_cid)
-                c_res = await db.execute(case_stmt)
-                doc_cc = c_res.scalar_one_or_none()
-                doc_patient_id = doc_cc.patient_id if doc_cc else (uuid.UUID(doc_result.get("patient_id")) if doc_result.get("patient_id") else None)
-                if doc_patient_id:
-                    now = datetime.now(timezone.utc)
-                    doc_inbound = Communication(
-                        id=uuid.uuid4(),
-                        case_id=target_cid,
-                        patient_id=doc_patient_id,
-                        sender="doctor",
-                        channel=req.channel or "in_app_chat",
-                        language="en",
-                        content=req.message,
-                        acknowledged=True,
-                        sent_at=now
-                    )
-                    doc_outbound = Communication(
-                        id=uuid.uuid4(),
-                        case_id=target_cid,
-                        patient_id=doc_patient_id,
-                        sender="ai_doctor_copilot",
-                        channel=req.channel or "in_app_chat",
-                        language="en",
-                        content=response_data.outbound_message or "Clinical request processed successfully.",
-                        acknowledged=True,
-                        sent_at=now
-                    )
-                    db.add(doc_inbound)
-                    db.add(doc_outbound)
-                    await db.commit()
+            doc_inbound = Communication(
+                id=uuid.uuid4(),
+                user_id=current_user.user_id,
+                role="doctor",
+                case_id=target_cid,
+                patient_id=doc_patient_id,
+                session_id=active_session.id,
+                sender="doctor",
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=req.message,
+                acknowledged=True,
+                sent_at=now
+            )
+            doc_outbound = Communication(
+                id=uuid.uuid4(),
+                user_id=current_user.user_id,
+                role="doctor",
+                case_id=target_cid,
+                patient_id=doc_patient_id,
+                session_id=active_session.id,
+                sender="ai_doctor_copilot",
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=response_data.outbound_message or "Clinical request processed successfully.",
+                acknowledged=True,
+                sent_at=now
+            )
+            db.add(doc_inbound)
+            db.add(doc_outbound)
+            await db.commit()
         except Exception as e:
             import logging
             logging.getLogger("carebridge.agent").warning(f"Doctor communication persistence notice: {e}")
@@ -896,9 +955,47 @@ async def interact_with_agent(
                         else:
                             outbound_msg = "There are currently no new unassigned patient cases in the discovery queue."
 
+            # Persist general coordinator communication in communications table
+            try:
+                coord_inbound = Communication(
+                    id=uuid.uuid4(),
+                    user_id=current_user.user_id,
+                    role="care_coordinator",
+                    case_id=None,
+                    patient_id=None,
+                    session_id=active_session.id,
+                    sender="care_coordinator",
+                    channel=req.channel or "in_app_chat",
+                    language="en",
+                    content=req.message,
+                    acknowledged=True,
+                    sent_at=now
+                )
+                coord_outbound = Communication(
+                    id=uuid.uuid4(),
+                    user_id=current_user.user_id,
+                    role="care_coordinator",
+                    case_id=None,
+                    patient_id=None,
+                    session_id=active_session.id,
+                    sender="ai_coordinator",
+                    channel=req.channel or "in_app_chat",
+                    language="en",
+                    content=outbound_msg,
+                    acknowledged=True,
+                    sent_at=now
+                )
+                db.add(coord_inbound)
+                db.add(coord_outbound)
+                await db.commit()
+            except Exception as e:
+                import logging
+                logging.getLogger("carebridge.agent").warning(f"Coordinator non-case communication persistence notice: {e}")
+
             response_data = AgentExecutionResponse(
                 case_id="",
                 patient_id="",
+                session_id=str(active_session.id),
                 primary_intent=intent.primary_intent,
                 emotional_state="neutral",
                 detected_barriers=[],
@@ -914,21 +1011,13 @@ async def interact_with_agent(
                 data=response_data
             )
 
-        # Step 0: Resolve or link active ConversationSession
-        active_session: Optional[ConversationSession] = None
+        # Step 0: Link active ConversationSession with care_case
         try:
-            session_stmt = (
-                select(ConversationSession)
-                .where(
-                    ConversationSession.patient_id == care_case.patient_id,
-                    ConversationSession.is_active.is_(True)
-                )
-                .order_by(ConversationSession.last_interaction_at.desc())
-            )
-            session_res = await db.execute(session_stmt)
-            active_session = session_res.scalars().first()
-            if active_session:
+            if care_case:
+                active_session.case_id = care_case.id
+                active_session.patient_id = care_case.patient_id
                 active_session.last_interaction_at = datetime.now(timezone.utc)
+                await db.flush()
         except Exception as e:
             import logging
             logging.getLogger("carebridge.agent").warning(f"Coordinator session resolution notice: {e}")
@@ -1188,56 +1277,77 @@ async def get_chat_history(
 ):
     """
     Retrieves chronological, PostgreSQL-backed conversation history with role authorization.
-    Patients are strictly isolated to their own records.
+    Strict session isolation: a user can only read their own sessions.
     """
     user_role = current_user.role.lower()
+    user_id = current_user.user_id
     p_id: Optional[uuid.UUID] = None
 
-    if user_role == "patient":
-        if not current_user.patient_id:
-            raise HTTPException(status_code=403, detail="Forbidden: No patient profile associated with account.")
-        p_id = uuid.UUID(current_user.patient_id)
-        if case_id:
-            case_stmt = select(CareCase).where(CareCase.id == case_id)
-            case_res = await db.execute(case_stmt)
-            care_case = case_res.scalar_one_or_none()
-            if not care_case:
-                raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-            if care_case.patient_id != p_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Forbidden: You do not have permission to access another patient's communication history."
-                )
-    elif user_role in ("clinician", "doctor", "specialist"):
-        if case_id:
-            case_stmt = select(CareCase).where(CareCase.id == case_id)
-            case_res = await db.execute(case_stmt)
-            care_case = case_res.scalar_one_or_none()
-            if not care_case:
-                raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-            p_id = care_case.patient_id
-    elif user_role in ("care_coordinator", "coordinator"):
-        if case_id:
-            case_stmt = select(CareCase).where(CareCase.id == case_id)
-            case_res = await db.execute(case_stmt)
-            care_case = case_res.scalar_one_or_none()
-            if not care_case:
-                raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
-            p_id = care_case.patient_id
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Forbidden: Role '{user_role}' is not authorized to access chat history."
-        )
-
-    # Base query
-    query = select(Communication)
-    if p_id:
-        query = query.where(Communication.patient_id == p_id)
-    if case_id:
-        query = query.where(Communication.case_id == case_id)
     if session_id:
-        query = query.where(Communication.session_id == session_id)
+        sess_stmt = select(ConversationSession).where(ConversationSession.id == session_id)
+        sess_res = await db.execute(sess_stmt)
+        target_session = sess_res.scalar_one_or_none()
+        if not target_session:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Session {session_id} not found.")
+
+        is_owner = False
+        if target_session.user_id and target_session.user_id == user_id:
+            is_owner = True
+        elif user_role == "patient" and current_user.patient_id and target_session.patient_id:
+            if str(target_session.patient_id) == str(current_user.patient_id):
+                is_owner = True
+
+        if not is_owner:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Forbidden: You cannot access another user's conversation session."
+            )
+
+        query = select(Communication).where(Communication.session_id == session_id)
+    else:
+        if user_role == "patient":
+            if not current_user.patient_id:
+                raise HTTPException(status_code=403, detail="Forbidden: No patient profile associated with account.")
+            p_id = uuid.UUID(current_user.patient_id)
+            if case_id:
+                case_stmt = select(CareCase).where(CareCase.id == case_id)
+                case_res = await db.execute(case_stmt)
+                care_case = case_res.scalar_one_or_none()
+                if not care_case:
+                    raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+                if care_case.patient_id != p_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Forbidden: You do not have permission to access another patient's communication history."
+                    )
+            query = select(Communication).where(Communication.patient_id == p_id)
+            if case_id:
+                query = query.where(Communication.case_id == case_id)
+        elif user_role in ("clinician", "doctor", "specialist"):
+            if case_id:
+                case_stmt = select(CareCase).where(CareCase.id == case_id)
+                case_res = await db.execute(case_stmt)
+                care_case = case_res.scalar_one_or_none()
+                if not care_case:
+                    raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+                query = select(Communication).where(Communication.case_id == case_id)
+            else:
+                query = select(Communication).where(Communication.user_id == user_id)
+        elif user_role in ("care_coordinator", "coordinator"):
+            if case_id:
+                case_stmt = select(CareCase).where(CareCase.id == case_id)
+                case_res = await db.execute(case_stmt)
+                care_case = case_res.scalar_one_or_none()
+                if not care_case:
+                    raise HTTPException(status_code=404, detail=f"Case {case_id} not found")
+                query = select(Communication).where(Communication.case_id == case_id)
+            else:
+                query = select(Communication).where(Communication.user_id == user_id)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Forbidden: Role '{user_role}' is not authorized to access chat history."
+            )
 
     count_query = select(func.count()).select_from(query.subquery())
     total_res = await db.execute(count_query)
@@ -1280,35 +1390,37 @@ async def get_chat_history(
 @router.get("/sessions", response_model=ApiResponseEnvelope[List[ConversationSessionResponse]], summary="List Conversation Sessions")
 async def get_conversation_sessions(
     case_id: Optional[uuid.UUID] = None,
+    q: Optional[str] = None,
     current_user: UserPrincipal = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db)
 ):
-    """Retrieves conversation sessions for the authorized user / care case."""
+    """Retrieves conversation sessions owned strictly by the authenticated user."""
     user_role = current_user.role.lower()
-    p_id: Optional[uuid.UUID] = None
+    user_uuid = uuid.UUID(str(current_user.user_id))
 
     if user_role == "patient":
         if not current_user.patient_id:
             raise HTTPException(status_code=403, detail="Forbidden: No patient profile associated with account.")
-        p_id = uuid.UUID(current_user.patient_id)
-    elif user_role in ("clinician", "doctor", "specialist", "care_coordinator", "coordinator"):
-        if case_id:
-            case_stmt = select(CareCase).where(CareCase.id == case_id)
-            case_res = await db.execute(case_stmt)
-            care_case = case_res.scalar_one_or_none()
-            if care_case:
-                p_id = care_case.patient_id
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Forbidden: Role '{user_role}' is not authorized to access sessions."
+        p_uuid = uuid.UUID(current_user.patient_id)
+        query = select(ConversationSession).where(
+            or_(
+                ConversationSession.user_id == user_uuid,
+                and_(ConversationSession.user_id.is_(None), ConversationSession.patient_id == p_uuid)
+            )
         )
+    else:
+        query = select(ConversationSession).where(ConversationSession.user_id == user_uuid)
 
-    query = select(ConversationSession)
-    if p_id:
-        query = query.where(ConversationSession.patient_id == p_id)
     if case_id:
         query = query.where(ConversationSession.case_id == case_id)
+    if q:
+        search_term = f"%{q.strip().lower()}%"
+        query = query.where(
+            or_(
+                ConversationSession.title.ilike(search_term),
+                ConversationSession.summary.ilike(search_term)
+            )
+        )
 
     query = query.order_by(ConversationSession.last_interaction_at.desc())
     res = await db.execute(query)
@@ -1317,7 +1429,10 @@ async def get_conversation_sessions(
     session_items = [
         ConversationSessionResponse(
             id=str(s.id),
-            patient_id=str(s.patient_id),
+            user_id=str(s.user_id) if s.user_id else str(user_uuid),
+            role=s.role or user_role,
+            title=s.title or (s.summary[:40] if s.summary else "New Chat"),
+            patient_id=str(s.patient_id) if s.patient_id else None,
             case_id=str(s.case_id) if s.case_id else None,
             channel=s.channel,
             summary=s.summary,
@@ -1343,41 +1458,24 @@ async def create_conversation_session(
     current_user: UserPrincipal = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db)
 ):
-    """Creates a new active conversation session, retiring previous active sessions."""
+    """Creates a new active conversation session owned strictly by current_user."""
     user_role = current_user.role.lower()
+    user_uuid = uuid.UUID(str(current_user.user_id))
     p_id: Optional[uuid.UUID] = None
 
     if user_role == "patient":
         if not current_user.patient_id:
             raise HTTPException(status_code=403, detail="Forbidden: No patient profile associated with account.")
         p_id = uuid.UUID(current_user.patient_id)
-    elif user_role in ("clinician", "doctor", "specialist", "care_coordinator", "coordinator"):
-        if req.case_id:
-            case_stmt = select(CareCase).where(CareCase.id == req.case_id)
-            case_res = await db.execute(case_stmt)
-            care_case = case_res.scalar_one_or_none()
-            if not care_case:
-                raise HTTPException(status_code=404, detail="Care case not found.")
-            p_id = care_case.patient_id
-        else:
-            raise HTTPException(status_code=400, detail="case_id is required to create session as clinician/coordinator.")
-    else:
-        raise HTTPException(status_code=403, detail=f"Forbidden: Role '{user_role}' cannot create conversation sessions.")
-
-    # Mark existing active sessions as inactive
-    active_stmt = select(ConversationSession).where(
-        ConversationSession.patient_id == p_id,
-        ConversationSession.is_active.is_(True)
-    )
-    if req.case_id:
-        active_stmt = active_stmt.where(ConversationSession.case_id == req.case_id)
-    active_res = await db.execute(active_stmt)
-    for existing in active_res.scalars().all():
-        existing.is_active = False
+    elif req.patient_id:
+        p_id = req.patient_id
 
     now = datetime.now(timezone.utc)
     new_session = ConversationSession(
         id=uuid.uuid4(),
+        user_id=user_uuid,
+        role=user_role,
+        title=req.title or "New Chat",
         patient_id=p_id,
         case_id=req.case_id,
         channel=req.channel or "in_app_chat",
@@ -1393,7 +1491,10 @@ async def create_conversation_session(
         message="Created new conversation session.",
         data=ConversationSessionResponse(
             id=str(new_session.id),
-            patient_id=str(new_session.patient_id),
+            user_id=str(new_session.user_id),
+            role=new_session.role,
+            title=new_session.title,
+            patient_id=str(new_session.patient_id) if new_session.patient_id else None,
             case_id=str(new_session.case_id) if new_session.case_id else None,
             channel=new_session.channel,
             summary=new_session.summary,
@@ -1403,4 +1504,78 @@ async def create_conversation_session(
             last_interaction_at=new_session.last_interaction_at,
             created_at=new_session.created_at
         )
+    )
+
+
+@router.patch("/sessions/{session_id}", response_model=ApiResponseEnvelope[ConversationSessionResponse], summary="Rename Conversation Session")
+async def rename_conversation_session(
+    session_id: uuid.UUID,
+    req: RenameSessionRequest,
+    current_user: UserPrincipal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """Renames an existing conversation session. Only the owner can rename."""
+    sess_stmt = select(ConversationSession).where(ConversationSession.id == session_id)
+    sess_res = await db.execute(sess_stmt)
+    sess = sess_res.scalar_one_or_none()
+    if not sess:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation session not found.")
+
+    is_owner = (str(sess.user_id) == str(current_user.user_id)) or (
+        current_user.role.lower() == "patient" and current_user.patient_id and str(sess.patient_id) == str(current_user.patient_id)
+    )
+    if not is_owner:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: You can only rename your own conversations.")
+
+    sess.title = req.title.strip()
+    sess.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(sess)
+
+    return ApiResponseEnvelope(
+        success=True,
+        message="Conversation renamed successfully.",
+        data=ConversationSessionResponse(
+            id=str(sess.id),
+            user_id=str(sess.user_id) if sess.user_id else str(current_user.user_id),
+            role=sess.role or current_user.role.lower(),
+            title=sess.title,
+            patient_id=str(sess.patient_id) if sess.patient_id else None,
+            case_id=str(sess.case_id) if sess.case_id else None,
+            channel=sess.channel,
+            summary=sess.summary,
+            is_active=sess.is_active,
+            last_interaction_at=sess.last_interaction_at,
+            created_at=sess.created_at
+        )
+    )
+
+
+@router.delete("/sessions/{session_id}", summary="Delete Conversation Session")
+async def delete_conversation_session(
+    session_id: uuid.UUID,
+    current_user: UserPrincipal = Depends(get_current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    """Deletes an existing conversation session and its communications. Only owner can delete."""
+    sess_stmt = select(ConversationSession).where(ConversationSession.id == session_id)
+    sess_res = await db.execute(sess_stmt)
+    sess = sess_res.scalar_one_or_none()
+    if not sess:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation session not found.")
+
+    is_owner = (str(sess.user_id) == str(current_user.user_id)) or (
+        current_user.role.lower() == "patient" and current_user.patient_id and str(sess.patient_id) == str(current_user.patient_id)
+    )
+    if not is_owner:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: You can only delete your own conversations.")
+
+    await db.execute(delete(Communication).where(Communication.session_id == session_id))
+    await db.delete(sess)
+    await db.commit()
+
+    return ApiResponseEnvelope(
+        success=True,
+        message="Conversation deleted successfully.",
+        data={"deleted": True, "session_id": str(session_id)}
     )
