@@ -20,7 +20,7 @@ class BackgroundSchedulerManager:
 
     _is_running = False
     _thread: Optional[threading.Thread] = None
-    _interval_seconds = 3600  # Default 1 hour
+    _interval_seconds = 900  # Default 15 minutes (proactive follow-up cadence)
     _stop_event = threading.Event()
 
     @classmethod
@@ -41,6 +41,8 @@ class BackgroundSchedulerManager:
                 return SchedulerJobs.scan_appointment_reminders(session)
             elif job_name == "scan_expired_doctor_assignments":
                 return SchedulerJobs.scan_expired_doctor_assignments(session)
+            elif job_name == "run_proactive_followups":
+                return SchedulerJobs.run_proactive_followups(session)
             else:
                 raise ValueError(f"Unknown scheduler job: {job_name}")
 
@@ -61,12 +63,13 @@ class BackgroundSchedulerManager:
             "scan_overdue_tasks",
             "scan_appointment_reminders",
             "scan_expired_doctor_assignments",
+            "run_proactive_followups",
         ]:
             results[job] = cls.run_job(job, db=db)
         return results
 
     @classmethod
-    def start(cls, interval_seconds: int = 3600):
+    def start(cls, interval_seconds: int = 900):
         """Starts the background scheduler thread."""
         if cls._is_running:
             logger.warning("[SchedulerManager] Scheduler thread is already running.")
@@ -113,6 +116,9 @@ class BackgroundSchedulerManager:
                 "scan_stalled_cases",
                 "scan_sla_deadlines",
                 "scan_unacknowledged_outreach",
-                "scan_overdue_tasks"
+                "scan_overdue_tasks",
+                "scan_appointment_reminders",
+                "scan_expired_doctor_assignments",
+                "run_proactive_followups"
             ]
         }

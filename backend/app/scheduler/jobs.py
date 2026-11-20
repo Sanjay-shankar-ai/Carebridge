@@ -269,3 +269,14 @@ class SchedulerJobs:
         """
         from app.services.doctor_allocation_service import DoctorAllocationService
         return DoctorAllocationService.scan_and_expire_assignments(db)
+
+    @classmethod
+    def run_proactive_followups(
+        cls, db: Session, now: Any = None, tz_offset_minutes: Any = None
+    ) -> Dict[str, Any]:
+        """
+        Job 7 (B5): Every 15 minutes evaluates UPCOMING (24h & 2h), MISSED (+30m),
+        and OVERDUE FOLLOW-UP triggers with idempotency, outbox delivery, quiet hours, and tracing.
+        """
+        from app.services.proactive_followup_service import ProactiveFollowupService
+        return ProactiveFollowupService.evaluate_all(db, now=now, tz_offset_minutes=tz_offset_minutes)

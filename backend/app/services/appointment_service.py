@@ -673,3 +673,27 @@ class AppointmentService:
             "reason_category": reason_category or "other",
             "recovery_task_id": str(recovery_task.id),
         }
+
+    @classmethod
+    def mark_no_show(
+        cls,
+        db: Session,
+        appointment_id: Any,
+        actor_role: str,
+        actor_id: str,
+        notes: Optional[str] = None,
+    ) -> Appointment:
+        """Marks an appointment NO_SHOW — strictly restricted to authorized doctor or coordinator."""
+        if (actor_role or "").lower() not in ("doctor", "clinician", "specialist", "care_coordinator", "coordinator"):
+            raise PermissionError(
+                f"Role '{actor_role}' is not authorized to mark NO_SHOW. Only a doctor or care coordinator may do so."
+            )
+        appt_uuid = appointment_id if isinstance(appointment_id, uuid.UUID) else uuid.UUID(str(appointment_id))
+        appt = db.query(Appointment).filter(Appointment.id == appt_uuid).first()
+        if not appt:
+            raise ValueError(f"Appointment {appointment_id} not found")
+        appt.status = "NO_SHOW"
+        if notes:
+            appt.notes = f"{appt.notes or ''}\n[NO_SHOW by {actor_role}: {notes}]".strip()
+        db.commit()
+        return appt
