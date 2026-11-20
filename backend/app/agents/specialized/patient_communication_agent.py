@@ -1,11 +1,20 @@
 """
 CareBridge Patient Communication Agent
 Specialized agent responsible for:
-- Drafting empathetic, culturally attuned patient messages in English and Tamil
-- Explaining screening results and clinical findings (e.g. BI-RADS 4, Mammogram, Pap smear) in plain language
-- Explaining procedure steps (e.g. biopsy, ultrasound, consultations) to alleviate anxiety
-- Supporting language translation and accessible terminology
-- STRICT CLINICAL GUARDRAIL: Never diagnoses, never prescribes, never claims a definitive cancer diagnosis.
+- Drafting empathetic, counselling-style patient messages in English, Arabic, Spanish, and Tamil
+- Explaining screening results and clinical findings (e.g. BI-RADS 4, Mammogram) in plain language (grade 6-8)
+- Explaining diagnostic procedure steps (e.g. biopsy, ultrasound) without false reassurance
+- Strictly adhering to the 5-STEP COUNSELLING STRUCTURE:
+    1. Acknowledge the feeling in one sentence.
+    2. Answer the actual question in plain words.
+    3. Be honest about what cannot be known from the conversation.
+    4. Say what happens next and who will explain (the attending doctor, e.g. Dr. Arjun Menon).
+    5. Offer ONE gentle next step.
+- STRICT CLINICAL GUARDRAIL:
+    - Never states or implies "you have cancer" or "you do not have cancer".
+    - Never promises clinical outcomes (no "70% to 80% benign", no "peace of mind", no "don't worry").
+    - Short paragraphs, warm tone, no lists longer than 3 items.
+    - Uses finalized report ONLY as documented findings; if none exists, answers generally.
 """
 
 from typing import Dict, Any, List, Optional
@@ -13,7 +22,23 @@ from app.agents.state import CoordinationPlan, ProposedAction, IntentAnalysis
 
 
 class PatientCommunicationAgent:
-    """Specialized agent for empathetic patient education, reassurance, and communication."""
+    """Specialized agent for empathetic patient counselling, education, and reassurance without diagnosing."""
+
+    @classmethod
+    def _resolve_doctor_name(cls, case_context: Dict[str, Any]) -> str:
+        cr = case_context.get("clinical_review") or {}
+        co = case_context.get("consultation_outcome") or {}
+        return (
+            case_context.get("assigned_doctor_name")
+            or case_context.get("doctor_name")
+            or cr.get("doctor_name")
+            or co.get("doctor_name")
+            or "Dr. Arjun Menon"
+        )
+
+    @classmethod
+    def _resolve_coordinator_name(cls, case_context: Dict[str, Any]) -> str:
+        return case_context.get("current_owner_name") or "Priya Nair, RN"
 
     @classmethod
     def explain_finding(
@@ -22,67 +47,54 @@ class PatientCommunicationAgent:
         screening_type: str,
         patient_name: str,
         lang: str = "en",
-        inquiry_topic: Optional[str] = None
+        inquiry_topic: Optional[str] = None,
+        case_context: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Generates reassuring, factual explanation of screening findings without diagnosing."""
+        """
+        Generates 5-step counselling explanation of screening findings in plain language.
+        Never states/implies cancer diagnosis or non-diagnosis. Never promises outcomes.
+        """
+        ctx = case_context or {}
+        doc_name = cls._resolve_doctor_name(ctx)
+        coord_name = cls._resolve_coordinator_name(ctx)
         code_upper = (finding_code or "").upper()
-        
-        # BI-RADS Mammography findings
-        if "BI-RADS" in code_upper or "BIRADS" in code_upper or "4" in code_upper:
-            if lang == "ta":
-                return (
-                    f"வணக்கம் {patient_name}, BI-RADS 4 என்பது பரிசோதனையில் கூடுதல் தெளிவு தேவைப்படும் ஒரு மாறுபாடு மட்டுமே. "
-                    "இது புற்றுநோய் உறுதி செய்யப்பட்டதல்ல. பெரும்பாலான (சுமார் 70% முதல் 80%) பயாப்ஸி பரிசோதனைகளில் இது சாதாரண மாறுதலாகவே (benign) முடிவடைகிறது. "
-                    "முழுமையான மன அமைதிக்காக மட்டுமே மருத்துவர் இந்த பயாப்ஸி பரிசோதனையை பரிந்துரைத்துள்ளார். எங்கள் மருத்துவக் குழு உங்களுடன் துணை நிற்கும்."
-                )
-            if lang == "es":
-                return (
-                    f"Hola {patient_name}. Un hallazgo BI-RADS 4 indica una anomalía observada en su examen de {screening_type or 'mamografía'} "
-                    "que requiere una evaluación diagnóstica más detallada. Es fundamental señalar que BI-RADS 4 NO es un diagnóstico de cáncer. "
-                    "De hecho, aproximadamente entre el 70% y el 80% de las biopsias BI-RADS 4 resultan ser completamente benignas (no cancerosas). "
-                    "La evaluación de seguimiento es un paso preventivo estándar para brindarle a usted y a su equipo médico certeza y tranquilidad absoluta. "
-                    "¿Desea que le ayude a consultar las opciones de citas disponibles con la clínica del Dr. Thorne, o tiene alguna otra pregunta sobre el estudio?"
-                )
-            if lang == "ar":
-                return (
-                    f"مرحباً {patient_name}. تشير نتيجة BI-RADS 4 إلى ملاحظة تغير في فحص {screening_type or 'الماموجرام'} "
-                    "يتطلب تقييماً إضافياً لمزيد من الدقة. من المهم للغاية التأكيد على أن تصنيف BI-RADS 4 ليس تشخيصاً بالسرطان؛ "
-                    "ففي الواقع، نحو 70% إلى 80% من نتائج الخزعات لتصنيف BI-RADS 4 تظهر أنها حميدة تماماً (غير سرطانية). "
-                    "إن إجراء المتابعة أو الخزعة هو مجرد خطوة وقائية روتينية تهدف إلى منحك وفريقك الطبي الطمأنينة الكاملة واليقين. "
-                    "هل ترغبين في أن أساعدك في التحقق من خيارات المواعيد المتاحة لدى عيادة د. ثورن، أم لديك استفسارات أخرى عن الفحص؟"
-                )
-            return (
-                f"Hello {patient_name}. A BI-RADS 4 finding indicates an abnormality was noted on your screening {screening_type or 'mammogram'} "
-                "that has suspicious features and requires further evaluation. Crucially, BI-RADS 4 is NOT a diagnosis of cancer. "
-                "In fact, approximately 70% to 80% of BI-RADS 4 biopsies turn out to be completely benign (non-cancerous). "
-                "The follow-up diagnostic evaluation or biopsy is a routine, precautionary step so your clinical team can provide you complete certainty and peace of mind. "
-                "Would you like me to help check available appointment options with Dr. Thorne's clinic, or do you have other questions about the test?"
-            )
+        s_type = screening_type or "mammogram"
 
-        # General finding explanation
         if lang == "ta":
             return (
-                f"வணக்கம் {patient_name}, தங்களின் பரிசோதனை முடிவில் ({finding_code or screening_type}) கூடுதல் பரிசோதனை தேவைப்படுகிறது. "
-                "இது வழக்கமான ஒரு பாதுகாப்பு நடவடிக்கையே ஆகும். எவ்வித அச்சமும் தேவையில்லை; எங்கள் மருத்துவக் குழு உங்களுக்கு முழு ஆதரவு அளிக்கும். "
-                "சந்திப்பு நேரத்தை திட்டமிட உதவவா?"
+                f"மருத்துவ முடிவுகள் குறித்து அறியும்போது அச்சமும் கவலையும் ஏற்படுவது மிகவும் இயல்பானது {patient_name}.\n\n"
+                f"தங்களின் {s_type} பரிசோதனையில் குறிப்பிடப்பட்டுள்ள {finding_code or 'BI-RADS 4'} என்பது, "
+                "திசுக்களில் கூடுதல் தெளிவு தேவைப்படும் ஒரு மாறுபாடு கண்டறியப்பட்டுள்ளது என்பதைக் குறிக்கிறது; இதனை தெளிவுபடுத்த பயாப்ஸி பரிந்துரைக்கப்படுகிறது.\n\n"
+                "ஒரு செய்திப் பரிமாற்றத்தின் மூலம் இந்த திசு மாறுபாட்டின் தன்மையைக் கணிக்கவோ நோயறிதலை உறுதிப்படுத்தவோ முடியாது; "
+                "திசுவை ஆய்வகத்தில் முழுமையாக பரிசோதிப்பதன் மூலமே உண்மை நிலையை அறிய முடியும்.\n\n"
+                f"மருத்துவர் {doc_name} தங்களின் முழுப் பரிசோதனைப் படங்களை ஆய்வு செய்து, பயாப்ஸி முறை குறித்தும் அடுத்த கட்ட சிகிச்சைகள் குறித்தும் உங்களிடம் விரிவாக விளக்குவார்.\n\n"
+                f"மருத்துவர் {doc_name} உடனான சந்திப்பு நேரங்களை சரிபார்க்க உதவவா?"
             )
         if lang == "es":
             return (
-                f"Hola {patient_name}. El resultado de su examen ({finding_code or screening_type}) ha sido revisado por nuestro equipo clínico. "
-                "Encontrar un área que requiere una observación más detallada es muy común y no significa que haya un problema grave. "
-                "Una consulta de seguimiento es el paso más seguro para brindarle claridad total. ¿Desea revisar las opciones de citas próximas?"
+                f"Comprendo lo preocupante y angustiante que resulta leer estos términos y preguntarse qué significan para su salud, {patient_name}.\n\n"
+                f"Un hallazgo {finding_code or 'BI-RADS 4'} en su {s_type} significa que el radiólogo observó una zona que tiene características "
+                "que requieren una evaluación más detallada mediante una biopsia.\n\n"
+                "Una conversación o un estudio por imágenes por sí solos no pueden determinar un diagnóstico; "
+                "únicamente un médico examinando una muestra de tejido en el laboratorio puede brindar una respuesta certera.\n\n"
+                f"Su médico, el {doc_name}, revisará sus imágenes con usted directamente, le explicará los detalles y responderá a todas sus dudas clínicas.\n\n"
+                f"¿Le gustaría que le ayude a consultar los horarios de consulta disponibles con el {doc_name}?"
             )
         if lang == "ar":
             return (
-                f"مرحباً {patient_name}. تمت مراجعة نتيجة فحصك ({finding_code or screening_type}) من قِبل فريقنا السريري. "
-                "إن ملاحظة منطقة تحتاج إلى تدقيق إضافي أمر شائع جداً ولا يعني بالضرورة وجود أي مشكلة. "
-                "المتابعة الطبية هي الإجراء القياسي الأكثر أماناً لمنحك وضوحاً تاماً. هل ترغبين في المساعدة في مراجعة مواعيدك القادمة؟"
+                f"أدرك تماماً مدى القلق والتساؤلات التي قد تشعرين بها عند قراءة هذه النتائج الطبية يا {patient_name}.\n\n"
+                f"تشير نتيجة {finding_code or 'BI-RADS 4'} في فحص {s_type} إلى أن طبيب الأشعة لاحظ منطقة نسيجية تتطلب تقييماً إضافياً أكثر دقة من خلال أخذ عينة (خزعة).\n\n"
+                "لا يمكن لمحادثة نصية أو فحص إشعاعي بمفرده إعطاء تشخيص طبي قاطع؛ فالطبيب وحده، من خلال فحص عينة النسيج مخبرياً، يمكنه تحديد طبيعة الحالة بدقة.\n\n"
+                f"سيقوم طبيبكِ المعالج، {doc_name}، بمراجعة صور الفحص معكِ وشرح الخطوات التشخيصية والإجابة عن جميع استفساراتكِ الطبية.\n\n"
+                f"هل ترغبين في أن أساعدكِ في مراجعة مواعيد الاستشارة المتاحة لدى عيادة {doc_name}؟"
             )
+
         return (
-            f"Hello {patient_name}. Your screening result ({finding_code or screening_type}) has been reviewed by our clinical team. "
-            "Finding an area that needs a closer look is very common and does not mean anything is wrong. "
-            "A follow-up consultation or diagnostic imaging is simply the safest, standard step to give you complete clarity. "
-            "Would you like me to help review upcoming appointment options, or would you like to know more about the evaluation?"
+            f"I hear how stressful and concerning it is to read these terms and wonder what they mean for your health, {patient_name}.\n\n"
+            f"A {finding_code or 'BI-RADS 4'} finding on your {s_type} means the radiologist identified an area of tissue with features that require further evaluation, typically through a biopsy.\n\n"
+            "A chat conversation or an imaging scan alone cannot diagnose what this tissue represents; only a physician evaluating a tissue sample in a laboratory can provide a clear and definitive medical answer.\n\n"
+            f"Your attending doctor, {doc_name}, will review your imaging with you, discuss the findings, and walk you through any recommended next steps.\n\n"
+            f"Would you like me to help check available consultation openings with {doc_name}?"
         )
 
     @classmethod
@@ -92,39 +104,45 @@ class PatientCommunicationAgent:
         finding_code: str,
         screening_type: str,
         lang: str = "en",
-        coordinator_name: str = "Priya Nair, RN"
+        case_context: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Provides compassionate, validating reassurance for patient fear or anxiety without diagnosing."""
+        """Provides compassionate, validating reassurance using the 5-step counselling structure without diagnosing."""
+        ctx = case_context or {}
+        doc_name = cls._resolve_doctor_name(ctx)
+        coord_name = cls._resolve_coordinator_name(ctx)
+        s_type = screening_type or "mammogram"
+
         if lang == "ta":
             return (
-                f"உங்கள் உணர்வுகளை நாங்கள் முழுமையாக புரிந்து கொள்கிறோம் {patient_name}. "
-                "கூடுதல் பரிசோதனை தேவை என்று கேட்கும்போது பயமும் கவலையும் ஏற்படுவது மிகவும் இயல்பானது. "
-                f"இருப்பினும், {finding_code} போன்ற பெரும்பாலான பரிசோதனை முடிவுகள் (சுமார் 70% முதல் 80%) சாதாரண மாறுதலாகவே (benign) முடிவடைகின்றன. "
-                f"நீங்கள் இதில் தனியாக இல்லை—எங்கள் மருத்துவக் குழுவும் உங்கள் பராமரிப்பு ஒருங்கிணைப்பாளர் {coordinator_name}-உம் எப்போதும் உங்களுக்கு துணை நிற்போம். "
-                "பரிசோதனை வழிமுறைகள் குறித்து மேலும் அறிய விரும்புகிறீர்களா, அல்லது சந்திப்பு நேரத்தை திட்டமிட உதவவா?"
+                f"உங்கள் கவலையையும் அச்சத்தையும் நாங்கள் முழுமையாக உணர்கிறோம் {patient_name}; இதுபோன்ற நேரத்தில் பயம் ஏற்படுவது இயல்பானது.\n\n"
+                f"தங்களின் {s_type} பரிசோதனையில் ({finding_code}) கூடுதல் கவனம் தேவைப்படும் பகுதி கண்டறியப்பட்டுள்ளது, இது கவனமாக ஆராயப்பட வேண்டிய ஒன்று.\n\n"
+                "ஒரு செய்தியின் வாயிலாக எவ்வித மருத்துவ முடிவையும் கணிக்க முடியாது; மருத்துவரின் நேரடி பரிசோதனை மூலமே முழுமையான தெளிவு கிடைக்கும்.\n\n"
+                f"தங்களின் மருத்துவர் {doc_name} மற்றும் பராமரிப்பு ஒருங்கிணைப்பாளர் {coord_name} உங்களுக்குத் தேவையான முழு மருத்துவ வழிகாட்டுதலை வழங்குவர்.\n\n"
+                f"மருத்துவர் {doc_name} உடனான ஆலோசனை நேரத்தை திட்டமிட உதவவா?"
             )
         if lang == "es":
             return (
-                f"Comprendo profundamente lo que siente, {patient_name}, y es completamente normal y comprensible sentir temor o ansiedad en este momento. "
-                f"Escuchar que necesita una evaluación adicional ({finding_code}) puede ser inquietante, pero recuerde: "
-                "esto NO es un diagnóstico de cáncer. De hecho, aproximadamente entre el 70% y el 80% de las biopsias resultan ser completamente benignas. "
-                f"No está sola en este proceso—todo nuestro equipo de atención y su coordinadora de cuidados, {coordinator_name}, están a su lado en cada paso. "
-                "¿Le gustaría que le explique qué esperar durante la visita para mayor tranquilidad, o desea coordinar su cita?"
+                f"Comprendo profundamente el temor y la incertidumbre que siente en este momento, {patient_name}.\n\n"
+                f"Saber que se necesita una evaluación adicional tras su {s_type} ({finding_code}) genera muchas dudas que merecen atención cuidadosa.\n\n"
+                "Un mensaje de texto no puede reemplazar un diagnóstico médico ni anticipar resultados; sólo una evaluación clínica en persona puede ofrecerle claridad.\n\n"
+                f"Su médico, el {doc_name}, y su coordinadora de atención, {coord_name}, están a su disposición para acompañarle en cada etapa del proceso.\n\n"
+                f"¿Le gustaría revisar las opciones de citas disponibles para conversar con el {doc_name}?"
             )
         if lang == "ar":
             return (
-                f"نحن نتفهم مشاعرك تماماً يا {patient_name}، ومن الطبيعي والمفهوم جداً الشعور بالخوف أو القلق في هذا الوقت. "
-                f"إن معرفة أنك بحاجة إلى مزيد من التقييم لفحصك ({finding_code}) قد يثير القلق، ولكن تذكري دائماً: "
-                "هذا ليس تشخيصاً بالسرطان إطلاقاً. في الواقع، نحو 70% إلى 80% من الخزعات تنتهي بنتائج حميدة تماماً. "
-                f"أنتِ لستِ وحدك أبداً—فريقنا الطبي بأكمله ومنسقة رعايتك {coordinator_name} بجانبك في كل خطوة. "
-                "هل ترغبين في أن أشرح لكِ ما يمكن توقعه أثناء الزيارة لتهدئة قلقك، أم تودين تنسيق موعد مناسب؟"
+                f"أتفهم تماماً الخوف والمشاعر الصعبة التي تمرين بها في هذا الوقت يا {patient_name}، فمن الطبيعي جداً الشعور بالقلق.\n\n"
+                f"إن الحاجة إلى مزيد من التقييم بعد فحص {s_type} ({finding_code}) تعني ببساطة أن هناك ملاحظات تحتاج إلى فحص طبي إضافي متأنٍ.\n\n"
+                "لا يمكن لأي محادثة تقييم الحالة الصحية بصورة قاطعة؛ فالتقييم السريري لدى الطبيب المختص هو السبيل الوحيد للحصول على وضوح كامل.\n\n"
+                f"سيقوم طبيبكِ المعالج، {doc_name}، بالتعاون مع منسقة رعايتكِ {coord_name}، بمرافقتكِ وتقديم الشرح الطبي الوافي لكِ.\n\n"
+                f"هل ترغبين في المساعدة في حجز موعد استشارة مع {doc_name}؟"
             )
+
         return (
-            f"I hear you, {patient_name}, and it is completely normal and understandable to feel scared or anxious right now. "
-            f"Hearing that you need further evaluation for your {screening_type} ({finding_code}) can feel overwhelming, but please remember: "
-            "this is not a diagnosis of cancer. In fact, approximately 70% to 80% of biopsies turn out to be completely benign. "
-            f"You are not alone in this—our entire care team and your care coordinator, {coordinator_name}, are by your side at every step. "
-            "Would you like me to explain what to expect during the follow-up visit to help put your mind at ease, or would you like to explore scheduling options?"
+            f"I hear how frightening it is to face this uncertainty right now, {patient_name}.\n\n"
+            f"Hearing that you need further evaluation following your {s_type} ({finding_code}) brings up heavy questions that deserve careful attention.\n\n"
+            "A chat message cannot diagnose your condition or tell you what the future holds; only a clinical evaluation with a physician can give you clear answers.\n\n"
+            f"Your attending doctor, {doc_name}, and your care coordinator, {coord_name}, are right here to guide you through every step of this evaluation.\n\n"
+            f"Would you like me to help you review consultation times to speak with {doc_name}?"
         )
 
     @classmethod
@@ -132,63 +150,75 @@ class PatientCommunicationAgent:
         cls,
         procedure_type: str,
         patient_name: str,
-        lang: str = "en"
+        lang: str = "en",
+        case_context: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Explains diagnostic procedures (biopsy, imaging) in understandable terms to reduce fear."""
+        """Explains diagnostic procedures in plain, empathetic terms without false reassurance."""
+        ctx = case_context or {}
+        doc_name = cls._resolve_doctor_name(ctx)
         proc_lower = (procedure_type or "").lower()
-        
+
         if "biopsy" in proc_lower:
             if lang == "ta":
                 return (
-                    f"பயாப்ஸி குறித்து கவலைப்பட வேண்டாம் {patient_name}. மருத்துவர் பகுதி மயக்க மருந்து (local anesthesia) "
-                    "கொடுத்து செய்வதால் வலி இருக்காது; லேசான அழுத்தம் மட்டுமே உணரக்கூடும். இது சுமார் 20-30 நிமிடங்களில் முடிந்துவிடும் ஒரு எளிய புறநோயாளி பரிசோதனை மட்டுமே. "
-                    "எங்கள் மருத்துவக் குழு உங்களுடன் துணை நிற்கும்."
+                    f"பயாப்ஸி பரிசோதனை குறித்து கேட்கும்போது கவலை ஏற்படுவது இயற்கையே {patient_name}.\n\n"
+                    "பயாப்ஸி என்பது மருத்துவர் பகுதி மயக்க மருந்து (local numbing) அளித்து, மிகச் சிறிய திசு மாதிரியை எடுக்கும் ஒரு எளிய புறநோயாளி பரிசோதனை மட்டுமே.\n\n"
+                    "செயல்முறை எவ்வாறு நடைபெறும் என்பதை நாங்கள் விளக்கினாலும், அந்த திசுவின் முடிவுகள் ஆய்வகத்தில் ஆய்வு செய்யப்பட்ட பின்னரே உண்மை நிலை தெரியவரும்.\n\n"
+                    f"மருத்துவர் {doc_name} செயல்முறை குறித்து உங்களிடம் முழுமையாக விளக்கி, முடிவுகள் வந்தவுடன் உங்களுடன் கலந்துரையாடுவார்.\n\n"
+                    f"பரிசோதனைக்கு முன் மருத்துவர் {doc_name}-யிடம் கேட்க வேண்டிய கேள்விகளைத் தொகுக்க உதவவா?"
                 )
             if lang == "es":
                 return (
-                    f"Comprendemos que las preguntas sobre una biopsia puedan generar incertidumbre, {patient_name}. "
-                    "Una biopsia es un procedimiento ambulatorio estándar y mínimamente invasivo realizado con anestesia local, "
-                    "la cual adormece por completo la zona para que sólo sienta una ligera presión y ningún dolor. "
-                    "El procedimiento suele durar sólo de 20 a 30 minutos, y nuestro equipo de atención estará con usted en todo momento."
+                    f"Comprendo que la sola palabra biopsia pueda causarle preocupación y temor, {patient_name}.\n\n"
+                    "Una biopsia mamaria es un procedimiento ambulatorio estándar donde el médico toma una pequeña muestra de tejido aplicando anestesia local para minimizar cualquier molestia.\n\n"
+                    "Aunque podemos explicarle en qué consiste el procedimiento, sólo el análisis de patología en el laboratorio determinará la naturaleza del tejido.\n\n"
+                    f"Su médico, el {doc_name}, le explicará los pasos exactos durante su visita y analizará los resultados con usted tan pronto como estén listos.\n\n"
+                    f"¿Le gustaría preparar algunas preguntas para hacerle al {doc_name} antes de la cita?"
                 )
             if lang == "ar":
                 return (
-                    f"نتفهم تماماً أن الاستفسارات المتعلقة بالخزعة قد تسبب بعض القلق يا {patient_name}. "
-                    "الخزعة إجراء تشخيصي بسيط وغير جراحي يتم في العيادة تحت تأثير التخدير الموضعي، "
-                    "حيث يتم تخدير المنطقة بالكامل لتشعري بضغط خفيف فقط دون أي ألم. "
-                    "يستغرق الإجراء عادةً من 20 إلى 30 دقيقة فقط، وسيكون فريق الرعاية بجانبك طوال الوقت."
+                    f"أتفهم أن فكرة إجراء الخزعة قد تبعث على التوتر والقلق يا {patient_name}.\n\n"
+                    "الخزعة هي إجراء تشخيصي روتيني في العيادة، حيث يأخذ الطبيب عينة صغيرة جداً من النسيج باستخدام تخدير موضعي لتفادي الألم.\n\n"
+                    "ورغم توضيحنا لخطوات الإجراء، إلا أن فحص العينة في المختبر هو وحده الذي يكشف طبيعة النسيج بدقة.\n\n"
+                    f"سيشرح لكِ {doc_name} كافة تفاصيل الإجراء مسبقاً، وسيراجع معكِ نتائج التحليل فور صدورها.\n\n"
+                    f"هل ترغبين في تدوين بعض الأسئلة التي تودين طرحها على {doc_name}؟"
                 )
+
             return (
-                f"We understand questions about biopsies can feel stressful, {patient_name}. A breast biopsy is a standard, minimally invasive outpatient procedure "
-                "performed under local anesthesia, which numbs the area completely so you should only feel slight pressure, not pain. "
-                "The procedure typically takes only 20 to 30 minutes, and our care team will be by your side the entire time."
-            )
-            
-        if "pain" in proc_lower or "hurt" in proc_lower:
-            if lang == "ta":
-                return (
-                    f"உங்கள் உணர்வை நாங்கள் புரிந்து கொள்கிறோம் {patient_name}. லேசான வலி அல்லது அசௌகரியம் சாதாரணமானது. "
-                    "மருத்துவக் குழுவினர் உங்களை முழுமையாக கவனித்துக் கொள்வர்."
-                )
-            if lang == "es":
-                return (
-                    f"Gracias por compartir su preocupación sobre las molestias, {patient_name}. Su comodidad es nuestra máxima prioridad. "
-                    "Todos los procedimientos de seguimiento utilizan anestesia local suave para minimizar cualquier molestia."
-                )
-            if lang == "ar":
-                return (
-                    f"نشكرك على مشاركة مخاوفك بشأن الألم يا {patient_name}. راحتك هي أولويتنا القصوى، ويتم استخدام التخدير الموضعي اللطيف لتقليل أي انزعاج."
-                )
-            return (
-                f"Thank you for sharing your concerns about discomfort, {patient_name}. Your comfort is our top priority. "
-                "All follow-up procedures use gentle local numbing so you feel minimal discomfort. We will also document your sensitivity "
-                "in your case notes so Dr. Aris Thorne and your care coordinator can ensure your comfort throughout your visit."
+                f"I understand that hearing you need a biopsy can feel stressful and unsettling, {patient_name}.\n\n"
+                "A breast biopsy is a standard outpatient procedure where a doctor gently takes a small tissue sample using local numbing so you feel minimal discomfort.\n\n"
+                "While we can explain what happens during the procedure, only the pathology laboratory analysis can determine what the tissue is.\n\n"
+                f"Your doctor, {doc_name}, will walk you through the procedure beforehand and discuss the pathology findings directly with you.\n\n"
+                f"Would you like me to help you prepare a few questions to ask {doc_name}?"
             )
 
-        return (
-            f"Hello {patient_name}, we are here to support you through every step of your diagnostic care. "
-            "Please feel free to ask any questions about your upcoming visits or procedures."
-        )
+        # Discomfort / pain inquiry
+        if "pain" in proc_lower or "hurt" in proc_lower:
+            if lang == "es":
+                return (
+                    f"Comprendo su preocupación por el dolor durante los exámenes, {patient_name}.\n\n"
+                    "Durante estos procedimientos se utiliza anestesia local para adormecer el área, de modo que sólo sienta una leve presión.\n\n"
+                    "La sensibilidad de cada persona es única y el equipo adaptará la atención a su comodidad.\n\n"
+                    f"El {doc_name} se asegurará de que esté cómoda antes de iniciar cualquier paso.\n\n"
+                    f"¿Desea que anote su sensibilidad en sus notas de atención para el equipo médico?"
+                )
+            if lang == "ar":
+                return (
+                    f"أتفهم تماماً قلقكِ بشأن الشعور بأي ألم يا {patient_name}.\n\n"
+                    "يحرص الفريق الطبي على استخدام التخدير الموضعي لتخدير المنطقة بحيث لا تشعرين سوى بضغط خفيف.\n\n"
+                    "تختلف درجة الإحساس من شخص لآخر، وسيقوم الفريق بضبط الرعاية لتوفير أقصى درجات الراحة لكِ.\n\n"
+                    f"سيتأكد {doc_name} وفريق التمريض من راحتكِ طوال فترة الفحص.\n\n"
+                    f"هل تودين أن أسجل ملاحظة في ملفكِ ليأخذها الفريق في الاعتبار أثناء زيارتكِ؟"
+                )
+            return (
+                f"I understand your concern about pain and discomfort, {patient_name}.\n\n"
+                "During diagnostic procedures, local numbing is applied to the area so you should only feel light pressure rather than sharp pain.\n\n"
+                "Each person experiences sensations differently, and the clinical team will adjust to keep you comfortable throughout.\n\n"
+                f"Your doctor, {doc_name}, will check in with you continuously during the visit.\n\n"
+                f"Would you like me to note your sensitivity in your care file for {doc_name} and your coordinator?"
+            )
+
+        return cls.explain_finding("evaluation", "screening", patient_name, lang, inquiry_topic, case_context)
 
     @classmethod
     def answer_case_inquiry(
@@ -199,22 +229,22 @@ class PatientCommunicationAgent:
         lang: str = "en"
     ) -> Optional[str]:
         """
-        Dynamically answers the 9 critical longitudinal care journey inquiries without hallucinating:
-          1. What does my screening result mean?
-          2. Why does my doctor recommend further evaluation?
-          3. Has my referral been accepted?
-          4. When is my appointment?
-          5. What should I expect during my consultation?
-          6. What did my doctor recommend?
-          7. What happens next in my treatment?
-          8. When is my next follow-up?
-          9. Have all my care steps been completed?
+        Dynamically answers patient inquiries grounding in documented case facts only.
+        Follows the 5-step counselling structure:
+        (1) Acknowledge feeling in 1 sentence.
+        (2) Answer in plain words.
+        (3) Honest about what cannot be known from chat.
+        (4) Say what happens next and who will explain (doctor).
+        (5) ONE gentle next step.
         """
         msg_lower = (message or "").lower()
         patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        doc_name = cls._resolve_doctor_name(case_context)
+        coord_name = cls._resolve_coordinator_name(case_context)
         screening_type = case_context.get("screening_type", "mammogram")
         finding_code = case_context.get("finding_code", "BI-RADS 4")
-        finding_summary = case_context.get("finding_summary", "suspicious finding requiring further evaluation")
+        finding_summary = case_context.get("finding_summary", "focal asymmetry requiring further diagnostic evaluation")
+
         stages = case_context.get("lifecycle_stages") or []
         cr = case_context.get("clinical_review") or {}
         co = case_context.get("consultation_outcome") or {}
@@ -222,33 +252,81 @@ class PatientCommunicationAgent:
         fu = case_context.get("follow_up") or {}
         is_closed = case_context.get("is_closed", False) or case_context.get("status") == "closed"
 
-        # 1. "What does my screening result mean?"
-        if any(term in msg_lower for term in ["screening result mean", "result mean", "what is my result", "what does my result"]):
-            if lang == "ta":
+        # Check if finalized report is available
+        has_finalized_report = (
+            case_context.get("screening_result") is not None
+            or any(s.get("stage_number") == 2 and s.get("status") == "completed" for s in stages)
+            or bool(case_context.get("finding_summary"))
+        )
+
+        # 1. "What does my report say?" / "my report what saying" / "what does my screening result mean?"
+        if any(term in msg_lower for term in [
+            "report what saying", "my report what saying", "what report saying", "my report saying",
+            "what does my report say", "what does my screening result mean", "result mean",
+            "what is my result", "what does my result", "que dice mi informe", "qué significa mi informe",
+            "ماذا يقول تقريري", "ماذا يعني تقريري"
+        ]):
+            if lang == "es":
+                if has_finalized_report:
+                    return (
+                        f"Comprendo lo importante que es tener información clara sobre lo que dice su informe, {patient_name}.\n\n"
+                        f"Su informe de {screening_type} documenta: hallazgo categorizado como {finding_code} ({finding_summary}).\n\n"
+                        "Un chat no puede diagnosticar ni interpretar estos hallazgos de forma aislada; sólo un médico evaluando las imágenes y las pruebas diagnósticas puede determinar su significado.\n\n"
+                        f"Su médico, el {doc_name}, revisará con usted estos resultados documentados y le explicará los pasos recomendados.\n\n"
+                        f"¿Le gustaría consultar las fechas disponibles para reunirse con el {doc_name}?"
+                    )
                 return (
-                    f"வணக்கம் {patient_name}, உங்கள் {screening_type} பரிசோதனையில் {finding_code} ({finding_summary}) கண்டறியப்பட்டுள்ளது. "
-                    "இது புற்றுநோய் உறுதி செய்யப்பட்டதல்ல. சுமார் 70% முதல் 80% பயாப்ஸி பரிசோதனைகளில் இது சாதாரண மாறுதலாகவே (benign) முடிகிறது. "
-                    "முழுமையான தெளிவு மற்றும் மன அமைதிக்காகவே இந்த கூடுதல் பரிசோதனை பரிந்துரைக்கப்பட்டுள்ளது."
+                    f"Comprendo su deseo de conocer los resultados de su informe, {patient_name}.\n\n"
+                    "En este momento, su informe diagnóstico definitivo aún no ha sido finalizado en nuestro sistema clínico.\n\n"
+                    "No podemos discutir hallazgos médicos hasta que el informe oficial esté debidamente firmado y validado.\n\n"
+                    f"Tan pronto como esté listo, su médico, el {doc_name}, lo revisará en detalle con usted.\n\n"
+                    f"¿Desea que le pida a su coordinadora {coord_name} que le notifique apenas esté disponible?"
+                )
+
+            if lang == "ar":
+                if has_finalized_report:
+                    return (
+                        f"أتفهم تماماً رغبتكِ في الحصول على توضيح دقيق ومبسط لما ورد في تقريركِ الطبي يا {patient_name}.\n\n"
+                        f"يوثق تقرير فحص {screening_type} المعتمد لديكِ: نتيجة مصنفة كـ {finding_code} ({finding_summary}).\n\n"
+                        "لا يمكن لأي محادثة نصية وضع تشخيص أو تفسير التقرير بمعزل عن الفحص الطبي المباشر؛ فالطبيب وحده من يحدد دلالة هذه الملاحظات بدقة.\n\n"
+                        f"سيقوم طبيبكِ المعالج، {doc_name}، بمراجعة هذه النتائج الموثقة معكِ وتوضيح الخطوات الطبية القادمة.\n\n"
+                        f"هل ترغبين في المساعدة في مراجعة المواعيد المتاحة لدى عيادة {doc_name}؟"
+                    )
+                return (
+                    f"أتفهم تماماً حرصكِ على معرفة ما يتضمنه تقريركِ الطبي يا {patient_name}.\n\n"
+                    "تقريركِ التشخيصي النهائي لم يكتمل اعتماده بعد في نظامنا السريري وهو قيد المراجعة الرسمية.\n\n"
+                    "لا يمكننا مناقشة أي نتائج طبية قبل توثيق التقرير النهائي وتوقيعه رسمياً من الفريق المختص.\n\n"
+                    f"وفور اعتماده، سيقوم طبيبكِ، {doc_name}، بمراجعته معكِ وتقديم التوجيه الكامل.\n\n"
+                    f"هل تودين أن أطلب من منسقة رعايتكِ {coord_name} إشعاركِ فور جهوزية التقرير؟"
+                )
+
+            # English default
+            if has_finalized_report:
+                return (
+                    f"I understand how important it is to have clear, straightforward information about what is documented in your report, {patient_name}.\n\n"
+                    f"Your finalized {screening_type} report documents: {finding_code} ({finding_summary}).\n\n"
+                    "A chat conversation cannot diagnose your condition or interpret tissue characteristics from these notes alone; only a medical doctor examining your clinical tests can determine what they mean.\n\n"
+                    f"Your attending doctor, {doc_name}, will review these documented findings with you directly and discuss the next steps in your care.\n\n"
+                    f"Would you like me to check available consultation openings with {doc_name}?"
                 )
             return (
-                f"Hello {patient_name}. Your {screening_type} showed a finding categorized as {finding_code} ({finding_summary}). "
-                "This means an area was detected that requires closer examination. Crucially, this is NOT a diagnosis of cancer; in fact, 70% to 80% of such findings turn out to be completely benign (non-cancerous). "
-                "The follow-up evaluation is a standard precautionary step to provide complete certainty and reassurance."
+                f"I understand how eager you are to see what your report says, {patient_name}.\n\n"
+                "Your finalized diagnostic report has not yet been uploaded and approved in your medical record.\n\n"
+                "We cannot interpret or speculate on findings until the official clinical report is signed off by the radiology team.\n\n"
+                f"As soon as it is validated, your doctor, {doc_name}, will review it thoroughly with you.\n\n"
+                f"Would you like me to ask your care coordinator {coord_name} to notify you as soon as the finalized report is available?"
             )
 
         # 2. "Why does my doctor recommend further evaluation?"
         if any(term in msg_lower for term in ["why does my doctor recommend", "why do i need further evaluation", "recommend further evaluation", "why further evaluation"]):
-            doc_name = cr.get("doctor_name") or "Dr. Aris Thorne"
-            pathway = cr.get("approved_pathway") or "specialist diagnostic biopsy and ultrasound"
+            pathway = cr.get("approved_pathway") or "specialist diagnostic biopsy and targeted ultrasound"
             assessment = cr.get("clinical_assessment") or finding_summary
-            if lang == "ta":
-                return (
-                    f"வணக்கம் {patient_name}, மருத்துவர் {doc_name} உங்கள் பரிசோதனை முடிவை ஆய்வு செய்து, "
-                    f"துல்லியமான நோயறிதல் தெளிவுக்காக {pathway} பரிந்துரைத்துள்ளார் ({assessment}). இது உங்கள் பாதுகாப்பை உறுதி செய்யும் வழக்கமான மருத்துவ வழிகாட்டுதல் ஆகும்."
-                )
             return (
-                f"Hello {patient_name}. Dr. {doc_name} reviewed your screening findings ({finding_code}) and assessed: {assessment}. "
-                f"Further evaluation through a {pathway} is recommended so that specialized tissue imaging or analysis can provide 100% diagnostic certainty and rule out any clinical risks."
+                f"I understand that being recommended for further testing brings up questions and worry, {patient_name}.\n\n"
+                f"Dr. {doc_name} reviewed your screening findings ({finding_code}) and recommended a {pathway} based on the assessment: {assessment}.\n\n"
+                "A recommendation for further evaluation is a diagnostic investigation, not a final medical diagnosis; only specialized tissue testing can provide complete clarity.\n\n"
+                f"Dr. {doc_name} will conduct this evaluation and discuss what is found directly with you.\n\n"
+                f"Would you like me to help check scheduling openings with Dr. {doc_name}'s clinic?"
             )
 
         # 3. "Has my referral been accepted?"
@@ -260,13 +338,20 @@ class PatientCommunicationAgent:
             specialty = (ref.get("specialty") if ref else None) or "Breast Surgical Oncology"
 
             if is_accepted:
-                if lang == "ta":
-                    return f"ஆம் {patient_name}, {target_facility} மருத்துவ மையம் உங்கள் {specialty} பரிந்துரையை முறைப்படி ஏற்றுக்கொண்டுள்ளது. சந்திப்பு நேரத்தை உறுதி செய்ய உங்கள் ஒருங்கிணைப்பாளர் பணியாற்றி வருகிறார்."
-                return f"Yes, {patient_name}! Your specialist referral to {target_facility} for {specialty} has been officially accepted. Your care coordinator is currently finalizing convenient appointment options for your visit."
-            else:
-                if lang == "ta":
-                    return f"உங்கள் பரிந்துரை {target_facility} மையத்திற்கு அனுப்பப்பட்டுள்ளது, மேலும் 48 மணி நேரத்திற்குள் ஏற்றுக்கொள்ளப்படும் நிலையில் உள்ளது."
-                return f"Your specialist referral to {target_facility} has been transmitted and is currently under active clinical review. Specialist facilities typically confirm acceptance within our standard 48-hour SLA."
+                return (
+                    f"I understand you are waiting for news on your specialty care, {patient_name}.\n\n"
+                    f"Your specialist referral to {target_facility} for {specialty} has been officially accepted by the clinic.\n\n"
+                    "Our coordination team is actively aligning the clinic's schedule with your preferred availability.\n\n"
+                    f"Your care coordinator, {coord_name}, and Dr. {doc_name} will oversee your visit.\n\n"
+                    f"Would you like to review available appointment dates with {coord_name}?"
+                )
+            return (
+                f"I hear how anxious you are to hear about your referral status, {patient_name}.\n\n"
+                f"Your specialist referral to {target_facility} has been transmitted and is currently being processed by the clinical review team.\n\n"
+                "Referral processing involves verifying clinical details before appointment dates can be finalized.\n\n"
+                f"Your care coordinator, {coord_name}, is monitoring this closely with the clinic to ensure timely response.\n\n"
+                f"Would you like me to alert {coord_name} to check on the progress today?"
+            )
 
         # 4. "When is my appointment?"
         if any(term in msg_lower for term in ["when is my appointment", "appointment date", "time is my appointment", "my upcoming appointment", "when is the appointment"]):
@@ -277,97 +362,76 @@ class PatientCommunicationAgent:
 
             if appt and appt.get("scheduled_time"):
                 sched_time = appt.get("scheduled_time")
-                provider = appt.get("provider_name", "Dr. Aris Thorne")
+                provider = appt.get("provider_name", doc_name)
                 fac = appt.get("facility", "CareBridge Breast Health Clinic")
-                return f"Your appointment is confirmed for {sched_time} with {provider} at {fac}. Please arrive 15 minutes prior to your scheduled time."
-            elif stage_9 and stage_9.get("status") == "completed":
-                ev = stage_9.get("evidence") or {}
-                return f"Your appointment is confirmed for {ev.get('scheduled_time', 'the designated date')} with {ev.get('provider_name', 'Dr. Aris Thorne')} at {ev.get('facility', 'CareBridge Clinic')}."
-            else:
-                return f"You do not currently have a confirmed appointment on file, {patient_name}. Your care coordinator is actively coordinating with the clinic to secure the earliest convenient opening for you."
+                return (
+                    f"I understand you want to verify your scheduled visit, {patient_name}.\n\n"
+                    f"Your appointment is confirmed for {sched_time} with {provider} at {fac}.\n\n"
+                    "Please arrive 15 minutes before your time to complete any check-in paperwork.\n\n"
+                    f"{provider} will meet with you to review your care pathway in detail.\n\n"
+                    f"Would you like me to help you arrange transportation or review clinic preparation details?"
+                )
+            return (
+                f"I understand you want to know when your visit will take place, {patient_name}.\n\n"
+                "You do not currently have a confirmed appointment on file in your record.\n\n"
+                "Appointments are secured once clinic availability is matched with your preferences.\n\n"
+                f"Your care coordinator, {coord_name}, is actively working to coordinate available openings with {doc_name}'s clinic.\n\n"
+                f"Would you like me to look up available appointment slots right now?"
+            )
 
         # 5. "What should I expect during my consultation?"
         if any(term in msg_lower for term in ["expect during my consultation", "expect during consultation", "what to expect", "what happens during consultation", "during my consultation"]):
-            if lang == "ta":
-                return (
-                    f"வணக்கம் {patient_name}, உங்கள் ஆலோசனையின் போது மருத்துவர் உங்கள் உடல்நலம் குறித்து பேசுவார். "
-                    "தேவைப்பட்டால் சிறிய பயாப்ஸி அல்லது அல்ட்ராசவுண்ட் பரிசோதனை செய்யப்படும். பகுதி மயக்க மருந்து (local anesthesia) கொடுக்கப்படுவதால் வலி இருக்காது, லேசான அழுத்தம் மட்டுமே உணரக்கூடும். இது 20-30 நிமிடங்களில் முடிந்துவிடும்."
-                )
             return (
-                f"During your consultation, {patient_name}, the specialist will review your symptoms and medical history, perform a focused examination, and may perform a targeted ultrasound or gentle biopsy. "
-                "If a biopsy is conducted, the team uses local numbing medication so you only feel slight pressure, not pain. The entire visit typically takes about 20 to 30 minutes, and our care team will support you throughout."
+                f"I know that preparing for a specialist consultation can bring up questions and worry, {patient_name}.\n\n"
+                f"During your visit, Dr. {doc_name} will review your medical history, perform a focused physical exam, and explain any recommended diagnostic imaging or biopsy.\n\n"
+                "Every patient's clinical path is unique, so the exact steps will be determined based on Dr. {doc_name}'s evaluation.\n\n"
+                f"Dr. {doc_name} and the clinical nursing team will support you throughout the appointment and answer all your questions.\n\n"
+                f"Would you like me to help you write down a list of questions to bring with you to your visit?"
             )
 
         # 6. "What did my doctor recommend?"
         if any(term in msg_lower for term in ["what did my doctor recommend", "doctor's recommendation", "doctor recommend", "what did doctor say"]):
             if co and co.get("biopsy_pathology_outcome"):
-                doc_name = co.get("doctor_name", "Dr. Aris Thorne")
                 outcome = co.get("biopsy_pathology_outcome")
                 recs = co.get("clinical_recommendations", "Follow prescribed care plan")
-                plan = co.get("treatment_plan", "Routine surveillance")
                 return (
-                    f"Following your evaluation, Dr. {doc_name} recorded the following clinical outcome: "
-                    f"Pathology Result: {outcome}. "
-                    f"Recommendations: {recs}. "
-                    f"Care Plan: {plan}."
+                    f"I understand you are looking for clarity regarding the doctor's documented guidance, {patient_name}.\n\n"
+                    f"Following your evaluation, Dr. {doc_name} documented: Pathology Finding: {outcome}; Recommendations: {recs}.\n\n"
+                    "These clinical records represent documented findings and guidance; ongoing care requires continuous physician follow-up.\n\n"
+                    f"Dr. {doc_name} will review your ongoing care plan during your next follow-up.\n\n"
+                    f"Would you like me to check your next scheduled appointment with Dr. {doc_name}?"
                 )
-            elif cr and cr.get("approved_pathway"):
-                doc_name = cr.get("doctor_name", "Dr. Aris Thorne")
-                return f"Dr. {doc_name} reviewed your screening findings and recommended: {cr.get('approved_pathway')}. Assessment: {cr.get('clinical_assessment')}."
-            else:
-                return "Your attending physician has not yet finalized a specific clinical recommendation. Our team will notify you as soon as the doctor's review is submitted."
-
-        # 7. "What happens next in my treatment?"
-        if any(term in msg_lower for term in ["what happens next in my treatment", "next in my treatment", "treatment next steps", "happens next"]):
-            plan = tm.get("treatment_plan") or (co.get("treatment_plan") if co else None) or "Active clinical surveillance and care coordination"
-            fu_date = fu.get("scheduled_date") or (co.get("next_followup_date") if co else None)
-            fu_text = f" Your next follow-up evaluation is targeted for {fu_date}." if fu_date else ""
+            if cr and cr.get("approved_pathway"):
+                return (
+                    f"I understand you want to confirm your doctor's clinical recommendation, {patient_name}.\n\n"
+                    f"Dr. {doc_name} reviewed your screening findings and recommended: {cr.get('approved_pathway')}.\n\n"
+                    "This recommended pathway is a diagnostic plan designed to give your care team full clarity on your breast health.\n\n"
+                    f"Dr. {doc_name} will discuss this pathway in detail during your consultation.\n\n"
+                    f"Would you like to explore scheduling options for this consultation?"
+                )
             return (
-                f"Regarding your ongoing care, {patient_name}: Your active treatment plan is '{plan}'.{fu_text} "
-                "Our team will continue monitoring your health, and you can contact your care coordinator anytime if you experience any symptoms or have questions."
+                f"I understand you are awaiting the doctor's formal recommendation, {patient_name}.\n\n"
+                f"Dr. {doc_name} has not yet finalized a specific clinical recommendation in your case record.\n\n"
+                "Our team will not speculate on clinical guidance until Dr. {doc_name} completes the official review.\n\n"
+                f"Your care coordinator, {coord_name}, is tracking this review and will alert you once documented.\n\n"
+                f"Would you like me to notify {coord_name} to follow up on this review?"
             )
-
-        # 8. "When is my next follow-up?"
-        if any(term in msg_lower for term in ["when is my next follow-up", "next follow-up", "follow-up date", "when is follow up", "follow up scheduled"]):
-            fu_date = fu.get("scheduled_date") or (co.get("next_followup_date") if co else None)
-            fu_status = fu.get("status", "pending")
-            if fu_date:
-                return f"Your next follow-up milestone is scheduled for {fu_date} (Status: {fu_status.upper()}). We will send you reminders as the date approaches."
-            elif is_closed:
-                return "Your diagnostic care cycle is now complete! Dr. Thorne recommends routine annual preventive screening in 12 months."
-            else:
-                return f"A specific follow-up date has not yet been set, {patient_name}. Your care team will schedule this milestone once your current clinical phase is completed."
-
-        # 9. "Have all my care steps been completed?"
-        if any(term in msg_lower for term in ["have all my care steps been completed", "all care steps completed", "all my care steps", "care steps been completed", "is my case closed", "is my care completed"]):
-            stage_14 = next((s for s in stages if s.get("stage_number") == 14), None)
-            if is_closed or (stage_14 and stage_14.get("status") == "completed"):
-                doc_name = (stage_14.get("evidence") or {}).get("doctor_name") if stage_14 else "Dr. Aris Thorne"
-                doc_name = doc_name or "Dr. Aris Thorne"
-                return (
-                    f"Yes, {patient_name}! All 14 stages of your care journey have been successfully completed. "
-                    f"Dr. {doc_name} has conducted the final review, verified all diagnostic and pathology documentation, and executed official clinical closure sign-off. "
-                    "Your results are completely benign and reassuring. You may return to routine annual preventive screening."
-                )
-            else:
-                curr_num = case_context.get("current_stage_number", 1)
-                curr_id = case_context.get("current_stage_id", "ACTIVE")
-                return (
-                    f"Not quite yet, {patient_name}. Your care journey is currently at Stage {curr_num} of 14 ({curr_id.replace('_', ' ')}). "
-                    "Our care team will continue guiding you step-by-step until verified clinical closure is signed off by your doctor."
-                )
 
         return None
 
     @classmethod
     def _resolve_lang(cls, intent: IntentAnalysis, patient_context: Dict[str, Any]) -> str:
         raw_q = intent.raw_query or ""
+        pref = patient_context.get("preferred_language", "en")
         if any("\u0b80" <= c <= "\u0bff" for c in raw_q):
             return "ta"
-        if any("\u0600" <= c <= "\u06ff" for c in raw_q):
-            return "ar"
-        if intent.detected_language == "es" and any(w in raw_q.lower() for w in ["hola", "cita", "médico", "biopsia", "gracias"]):
+        if any("\u0600" <= c <= "\u06ff" for c in raw_q) or intent.detected_language == "ar" or pref == "ar":
+            if any("\u0600" <= c <= "\u06ff" for c in raw_q) or pref == "ar":
+                return "ar"
+        if intent.detected_language == "es" or any(w in raw_q.lower() for w in ["hola", "cita", "médico", "biopsia", "gracias", "tengo", "informe", "cáncer", "por favor"]):
             return "es"
+        if pref in ("es", "ar", "ta"):
+            return pref
         return "en"
 
     @classmethod
@@ -378,19 +442,21 @@ class PatientCommunicationAgent:
         case_context: Dict[str, Any],
         conversation_context: Dict[str, Any]
     ) -> CoordinationPlan:
-        """Formulates an educational communication plan with appropriate factual tools."""
+        """Formulates an empathetic counselling communication plan with verified 5-step response."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
         patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
         lang = cls._resolve_lang(intent, patient_context)
         finding_code = case_context.get("finding_code", "BI-RADS 4")
         screening_type = case_context.get("screening_type", "Mammogram")
+        doc_name = cls._resolve_doctor_name(case_context)
+        coord_name = cls._resolve_coordinator_name(case_context)
 
         actions: List[ProposedAction] = [
             ProposedAction(
                 step_number=1,
                 tool_name="get_screening_result",
                 arguments={"case_id": case_id},
-                rationale="Retrieve factual screening finding context to ground educational response.",
+                rationale="Retrieve factual screening finding context to ground counselling response.",
                 autonomy_level=1
             ),
             ProposedAction(
@@ -398,40 +464,36 @@ class PatientCommunicationAgent:
                 tool_name="update_case_notes",
                 arguments={
                     "case_id": case_id,
-                    "note": f"Patient inquired regarding {intent.inquiry_topic or 'screening finding'}. Provided empathetic medical education without diagnosing.",
+                    "note": f"Patient inquired regarding {intent.inquiry_topic or 'screening finding'}. Provided 5-step empathetic counselling without diagnosing.",
                     "barrier_detected": "fear_anxiety" if any(b.barrier_type == "fear_anxiety" for b in intent.detected_barriers) else None
                 },
-                rationale="Document patient educational touchpoint and reassurance in persistent case memory.",
+                rationale="Document patient counselling touchpoint in persistent case memory.",
                 autonomy_level=1
             )
         ]
 
-        # First check the 9 case-aware longitudinal inquiries
         raw_q = intent.raw_query or intent.inquiry_topic or ""
         inquiry_reply = cls.answer_case_inquiry(raw_q, case_context, patient_context, lang)
 
-        # Check if patient expressed fear, anxiety, or emotional distress
         is_anxious = (
             any(b.barrier_type == "fear_anxiety" for b in intent.detected_barriers)
             or intent.emotional_state in ("anxious", "overwhelmed", "fearful")
-            or any(w in raw_q.lower() for w in ["scared", "afraid", "nervous", "worried", "terrified", "fear", "anxious", "பயம்", "பயமாக", "miedo", "temor", "خوف", "خائفة"])
+            or any(w in raw_q.lower() for w in ["scared", "afraid", "nervous", "worried", "terrified", "fear", "anxious", "பயம்", "miedo", "temor", "خوف", "خائفة"])
         )
-
-        coord_name = case_context.get("current_owner_name") or "Priya Nair, RN"
 
         if inquiry_reply:
             msg = inquiry_reply
-        elif is_anxious and not any(term in raw_q.lower() for term in ["result mean", "what is my result", "what does my result", "bi-rads 4 mean"]):
-            msg = cls.provide_emotional_reassurance(patient_name, finding_code, screening_type, lang, coord_name)
+        elif is_anxious and not any(term in raw_q.lower() for term in ["result mean", "what is my result", "what does my result", "bi-rads", "birads"]):
+            msg = cls.provide_emotional_reassurance(patient_name, finding_code, screening_type, lang, case_context)
         elif intent.inquiry_topic == "biopsy" or "biopsy" in raw_q.lower():
-            msg = cls.explain_procedure("biopsy", patient_name, lang)
+            msg = cls.explain_procedure("biopsy", patient_name, lang, case_context)
         elif intent.inquiry_topic == "pain" or any(w in raw_q.lower() for w in ["pain", "hurt", "வலி", "dolor", "ألم"]):
-            msg = cls.explain_procedure("pain", patient_name, lang)
+            msg = cls.explain_procedure("pain", patient_name, lang, case_context)
         else:
-            msg = cls.explain_finding(finding_code, screening_type, patient_name, lang, intent.inquiry_topic)
+            msg = cls.explain_finding(finding_code, screening_type, patient_name, lang, intent.inquiry_topic, case_context)
 
         return CoordinationPlan(
-            goal="Provide empathetic, accurate medical education answering patient questions before scheduling.",
+            goal="Provide empathetic 5-step counselling answering patient questions before scheduling.",
             situation_summary=f"Patient inquired regarding screening finding {finding_code} (topic: {intent.inquiry_topic or 'general'}).",
             actions=actions,
             patient_response_draft=msg,
@@ -446,14 +508,15 @@ class PatientCommunicationAgent:
         case_context: Dict[str, Any],
         conversation_context: Optional[Dict[str, Any]] = None
     ) -> CoordinationPlan:
-        """Explains the clinical rationale behind the specialist referral in understandable terms."""
+        """Explains the clinical rationale behind the specialist referral in 5-step counselling tone."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
         patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
         lang = cls._resolve_lang(intent, patient_context)
         finding_code = case_context.get("finding_code", "BI-RADS 4")
         screening_type = case_context.get("screening_type", "mammogram")
         cr = case_context.get("clinical_review") or {}
-        doc_name = cr.get("doctor_name") or "Dr. Aris Thorne"
+        doc_name = cls._resolve_doctor_name(case_context)
+        coord_name = cls._resolve_coordinator_name(case_context)
         pathway = cr.get("approved_pathway") or "specialist diagnostic evaluation and ultrasound"
 
         actions: List[ProposedAction] = [
@@ -469,7 +532,7 @@ class PatientCommunicationAgent:
                 tool_name="update_case_notes",
                 arguments={
                     "case_id": case_id,
-                    "note": f"Explained referral rationale for {finding_code} to patient. Reassured non-diagnostic status.",
+                    "note": f"Explained referral rationale for {finding_code} to patient in 5-step counselling style.",
                     "barrier_detected": None
                 },
                 rationale="Document educational explanation of referral rationale in case notes.",
@@ -477,41 +540,33 @@ class PatientCommunicationAgent:
             )
         ]
 
-        if lang == "ta":
+        if lang == "es":
             msg = (
-                f"வணக்கம் {patient_name}, மருத்துவர் {doc_name} உங்கள் பரிசோதனை முடிவை ({finding_code}) ஆய்வு செய்து, "
-                f"துல்லியமான நோயறிதல் தெளிவுக்காகவே சிறப்பு மருத்துவ மையத்திற்கு பரிந்துரைத்துள்ளார் ({pathway}). "
-                "இது ஒரு வழக்கமான பாதுகாப்பு நடவடிக்கையே தவிர புற்றுநோய் உறுதி செய்யப்பட்டதல்ல. சுமார் 70% முதல் 80% பரிசோதனைகளில் இது சாதாரண மாறுதலாகவே (benign) முடிகிறது. "
-                "எங்கள் குழு உங்களுடன் துணை நிற்கும்."
-            )
-        elif lang == "es":
-            msg = (
-                f"Hola {patient_name}. El Dr. {doc_name} recomendó una derivación a un centro especializado tras su {screening_type} ({finding_code}) "
-                f"para asegurar que reciba una evaluación diagnóstica experta ({pathway}). "
-                "La derivación permite realizar análisis específicos para garantizar un 100% de certeza clínica. "
-                "Es importante destacar que una derivación es un paso preventivo de rutina y NO implica un diagnóstico de cáncer; "
-                "de hecho, entre el 70% y el 80% de estos hallazgos resultan ser completamente benignos. "
-                "¿Desea conocer detalles sobre el centro especializado o coordinar opciones de citas?"
+                f"Comprendo que recibir una derivación especializada genera inquietud y preguntas sobre su salud, {patient_name}.\n\n"
+                f"El {doc_name} recomendó esta derivación tras su {screening_type} ({finding_code}) para que un especialista realice una evaluación diagnóstica detallada ({pathway}).\n\n"
+                "Una derivación permite obtener evaluaciones avanzadas pero no constituye un diagnóstico definitivo en sí misma.\n\n"
+                f"El {doc_name} y su equipo le explicarán cada paso clínico durante su consulta especializada.\n\n"
+                f"¿Le gustaría coordinar las opciones de citas para su consulta con el {doc_name}?"
             )
         elif lang == "ar":
             msg = (
-                f"مرحباً {patient_name}. أوصى د. {doc_name} بإحالة تخصصية بعد فحص {screening_type} ({finding_code}) "
-                f"لضمان حصولك على تقييم تشخيصي دقيق وشامل ({pathway}). "
-                "تتيح هذه الإحالة للأخصائيين إجراء تصوير أو تقييم دقيق للوصول إلى يقين بنسبة 100%. "
-                "من الأهمية بمكان معرفة أن الإحالة إجراء وقائي قياسي ولا تعني أبداً الإصابة بالسرطان؛ ففي الواقع، 70% إلى 80% من الحالات تكون حميدة تماماً. "
-                "هل ترغبين في تفاصيل المركز المتخصص أو المساعدة في حجز الموعد؟"
+                f"أتفهم تماماً التساؤلات والقلق الذي قد يسببه الحصول على إحالة لمركز تخصصي يا {patient_name}.\n\n"
+                f"أوصى {doc_name} بهذه الإحالة بعد فحص {screening_type} ({finding_code}) لضمان خضوعكِ لتقييم تشخيصي متخصص وشامل ({pathway}).\n\n"
+                "تعد الإحالة خطوة تشخيصية متقدمة ولا تعني تشخيصاً نهائياً بحد ذاتها.\n\n"
+                f"سيقوم {doc_name} وفريق العيادة التخصصية بمتابعة كافة خطوات الرعاية معكِ بالتفصيل.\n\n"
+                f"هل تودين المساعدة في ترتيب موعدكِ مع عيادة {doc_name}؟"
             )
         else:
             msg = (
-                f"Hello {patient_name}. {doc_name} recommended a specialist referral following your {screening_type} ({finding_code}) "
-                f"to ensure you receive expert diagnostic evaluation ({pathway}). "
-                "A referral allows a breast care specialist to conduct targeted imaging or a gentle diagnostic evaluation to provide 100% certainty. "
-                "Crucially, a referral is a standard precautionary step and does NOT mean you have cancer—in fact, approximately 70% to 80% of such findings turn out to be completely benign. "
-                "Would you like me to share details about the specialist clinic or help with appointment options?"
+                f"I understand that receiving a specialist referral can bring up uncertainty and worry, {patient_name}.\n\n"
+                f"{doc_name} recommended this specialist referral following your {screening_type} ({finding_code}) to ensure you receive expert diagnostic evaluation ({pathway}).\n\n"
+                "A referral is an investigative clinical step to gather more detailed information; it is not a final medical diagnosis.\n\n"
+                f"{doc_name} and the specialist clinical team will guide you through the findings and next steps during your consultation.\n\n"
+                f"Would you like me to help check available consultation options with {doc_name}'s clinic?"
             )
 
         return CoordinationPlan(
-            goal="Explain clinical referral rationale empathetically and alleviate anxiety.",
+            goal="Explain clinical referral rationale empathetically with 5-step counselling structure.",
             situation_summary="Patient asked why doctor recommended a specialist referral.",
             actions=actions,
             patient_response_draft=msg,

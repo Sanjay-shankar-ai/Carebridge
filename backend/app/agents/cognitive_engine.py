@@ -775,7 +775,12 @@ class CognitiveEngine:
         elif any(term in msg_lower for term in ["cancel", "not coming", "stop"]):
             primary_intent = "appointment_cancellation_risk"
             requires_clarification = True
-        elif "?" in message or any(term in msg_lower for term in ["what is", "why do i need", "does it mean", "will it hurt", "biopsy mean", "bi-rads", "biopsy", "scared", "afraid", "fear", "miedo", "خوف", "خائفة"]):
+        elif "?" in message or any(term in msg_lower for term in [
+            "what is", "why do i need", "does it mean", "will it hurt", "biopsy mean",
+            "bi-rads", "birads", "bi rads", "biopsy", "cancer", "cáncer", "سرطان",
+            "what does", "do i have", "what mean", "mean do i have",
+            "scared", "afraid", "fear", "miedo", "خوف", "خائفة"
+        ]):
             primary_intent = "patient_inquiry"
 
         if not inquiry_topic:

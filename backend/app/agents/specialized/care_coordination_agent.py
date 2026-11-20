@@ -246,25 +246,46 @@ class CareCoordinationAgent:
             )
         ]
 
+        cr = case_context.get("clinical_review") or {}
+        doc_name = (
+            case_context.get("assigned_doctor_name")
+            or case_context.get("doctor_name")
+            or cr.get("doctor_name")
+            or "Dr. Arjun Menon"
+        )
+        coord_name = case_context.get("current_owner_name") or "Priya Nair, RN"
+
         if lang == "ta":
             msg = (
-                f"தாமதத்திற்கு மன்னிக்கவும் {patient_name}. எங்கள் பராமரிப்பு ஒருங்கிணைப்பாளர் பிரியா நாயர், ஆர்.என் "
-                "சிறப்பு மருத்துவ மையத்துடன் உடனடியாக தொடர்பு கொண்டு தங்களின் பரிந்துரையை விரைவுபடுத்துவார்."
+                f"மருத்துவர் அழைப்பிற்காக காத்திருப்பது மன உளைச்சலை ஏற்படுத்தும் என்பதை நாங்கள் உணர்கிறோம் {patient_name}.\n\n"
+                "மருத்துவ மையங்களில் பணிச்சுமை காரணமாக சில சமயங்களில் அழைப்புகள் தாமதமாகலாம்.\n\n"
+                "இந்த உரையாடலின் மூலம் எங்களால் நேரடியாக தொலைபேசி அழைப்பை மேற்கொள்ள முடியாது என்றாலும், எங்கள் குழு உடனடியாக நடவடிக்கை எடுக்கும்.\n\n"
+                f"உங்கள் பராமரிப்பு ஒருங்கிணைப்பாளர் {coord_name}, மருத்துவர் {doc_name} அலுவலகத்துடன் இன்று உடனடியாக தொடர்பு கொண்டு தங்களின் சந்திப்பை விரைவுபடுத்துவார்.\n\n"
+                f"மருத்துவர் {doc_name} அலுவலகம் உங்களைத் தொடர்பு கொள்ள வசதியான நேரத்தைக் குறிப்பிட விரும்புகிறீர்களா?"
             )
         elif lang == "es":
             msg = (
-                f"Gracias por informarnos, {patient_name}. He verificado el estado de su derivación y notificado a su coordinadora "
-                "de atención, Priya Nair, RN, para comunicarse con el centro especializado hoy mismo y agilizar su cita."
+                f"Comprendo lo frustrante y angustiante que resulta estar esperando la llamada del consultorio del médico, {patient_name}.\n\n"
+                "En ocasiones los consultorios especializados presentan demoras imprevistas en la programación de llamadas telefónicas.\n\n"
+                "Aunque este chat no puede comunicarse por teléfono directamente, nuestro equipo intervendrá de inmediato.\n\n"
+                f"Su coordinadora de cuidados, {coord_name}, se comunicará hoy mismo con el consultorio del {doc_name} para agilizar su cita.\n\n"
+                f"¿Desea confirmar el mejor número de teléfono y horario para que la clínica del {doc_name} se comunique con usted?"
             )
         elif lang == "ar":
             msg = (
-                f"شكراً لإبلاغنا بذلك يا {patient_name}. لقد تحققت من حالة إحالتك وأخطرت منسقة رعايتك المخصصة، "
-                "بريا ناير، للتواصل مع المركز التخصصي اليوم وتسريع تحديد موعدك."
+                f"أتفهم تماماً مدى الإحباط والقلق الذي قد يسببه انتظار اتصال عيادة الطبيب يا {patient_name}.\n\n"
+                "في بعض الأحيان تواجه العيادات التخصصية ضغطاً في جداول الاتصال، مما قد يؤدي إلى بعض التأخير.\n\n"
+                "ورغم أن هذه المحادثة لا تستطيع إجراء مكالمات هاتفية مباشرة، إلا أن فريقنا سيتدخل فوراً لدعمكِ.\n\n"
+                f"ستتواصل منسقة رعايتكِ، {coord_name}، مباشرة اليوم مع عيادة {doc_name} لتسريع التواصل معكِ.\n\n"
+                f"هل تودين تأكيد أفضل رقم هاتف ووقت مفضل لتتواصل معكِ عيادة {doc_name}؟"
             )
         else:
             msg = (
-                f"Thank you for bringing this to our attention, {patient_name}. I have checked your referral record and alerted "
-                "your dedicated care coordinator, Priya Nair, RN, to contact the specialty center today and expedite your scheduling."
+                f"I understand how frustrating and stressful it is to wait for the doctor's office to call, {patient_name}.\n\n"
+                "Specialist clinic offices sometimes experience unexpected scheduling backlogs or high call volumes, which can delay outreach.\n\n"
+                "While this chat cannot place phone calls directly, our care team can take immediate action on your behalf.\n\n"
+                f"Your care coordinator, {coord_name}, is following up directly with {doc_name}'s specialty clinic today to expedite your contact.\n\n"
+                f"Would you like to confirm the best phone number and time of day for {doc_name}'s clinic to reach you?"
             )
 
         return CoordinationPlan(

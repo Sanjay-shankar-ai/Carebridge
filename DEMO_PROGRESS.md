@@ -28,10 +28,26 @@
 ---
 
 ## Task 2: Counselling-Style Patient AI (Replace Cold Answers)
-- **Status:** TODO
-- **Goal:** Implement patient counselling prompt and deterministic distress/crisis safety guard.
-- **Files:** TBD
-- **Test Commands & Results:** TBD
+- **Status:** DONE
+- **Root Cause & Objective:** Cold, statistical answers ("70% to 80% benign", "peace of mind", "don't worry") and lack of deterministic crisis escalation replaced with warm, compassionate 5-step counselling structure: (1) 1-sentence validation, (2) plain words (grade 6-8), (3) honest about what cannot be known from chat, (4) doctor (Dr. Arjun Menon) will explain, (5) ONE gentle next step. Strict guardrails against diagnosing or denying cancer and against false reassurance.
+- **Files Changed / Added:**
+  - `backend/app/agents/prompts.py` (added `PATIENT_COUNSELLING_PROMPT` and counselling principles to system prompt)
+  - `backend/app/agents/specialized/clinical_escalation_agent.py` (deterministic crisis/distress triggers and escalation without LLM, 988/911/108 contacts, 5-step response)
+  - `backend/app/agents/specialized/patient_communication_agent.py` (5-step counselling across English, Spanish, Arabic, and Tamil; removed all statistical reassurance and cancer denial)
+  - `backend/app/agents/specialized/care_coordination_agent.py` (5-step referral delay response with Priya Nair and Dr. Arjun Menon)
+  - `backend/app/agents/cognitive_engine.py` (misspelling support for "birads" without hyphen and unpunctuated queries, crisis detection)
+  - `backend/tests/test_patient_counselling_ai.py` (8/8 golden verification tests)
+- **Exact Test Commands & Results:**
+  - Command: `pytest tests/test_patient_counselling_ai.py -v`
+  - Output: `8 passed in 16.62s`
+    - `test_golden_birads_explanation` PASSED
+    - `test_golden_birads_misspelling` PASSED
+    - `test_golden_am_i_going_to_die` PASSED
+    - `test_golden_i_am_so_scared` PASSED
+    - `test_golden_my_report_what_saying` PASSED
+    - `test_golden_doctor_not_call_me` PASSED
+    - `test_multilingual_spanish_counselling` PASSED
+    - `test_multilingual_arabic_counselling` PASSED
 
 ---
 
