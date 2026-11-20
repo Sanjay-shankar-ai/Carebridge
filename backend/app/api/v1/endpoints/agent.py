@@ -29,6 +29,7 @@ from app.workflows.doctor_workflow import run_doctor_workflow
 from app.agents.cognitive_engine import CognitiveEngine
 from app.tools.registry import ToolRegistry
 from app.services.response_guard_service import ResponseGuardService
+from app.services.patient_behaviour_router import PatientBehaviourRouter, BehaviourResult
 from app.core.security import get_current_user, UserPrincipal
 from app.core.rate_limiter import rate_limit_agent
 from app.schemas.common import ApiResponseEnvelope
@@ -107,6 +108,56 @@ class CreateSessionRequest(BaseModel):
 
 class RenameSessionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=255, description="New title for the conversation")
+
+
+async def _run_behaviour_turn(current_user, active_session, req, language: str):
+    """Runs deterministic behaviour flows (B1-B4) in a worker thread with a sync DB session."""
+    from fastapi.concurrency import run_in_threadpool
+
+    def _work():
+        if (current_user.role or "").lower() != "patient":
+            return None
+        patient_id = active_session.patient_id or current_user.patient_id
+        if not patient_id:
+            return None
+        with get_sync_db() as sdb:
+            return PatientBehaviourRouter.handle_turn(
+                sdb,
+                user_id=uuid.UUID(str(current_user.user_id)),
+                role="patient",
+                patient_id=patient_id,
+                session_id=active_session.id,
+                case_id=req.case_id or active_session.case_id,
+                message=req.message,
+                language=language if language in ("en", "es", "ar") else "en",
+            )
+
+    try:
+        return await run_in_threadpool(_work)
+    except Exception as exc:  # a behaviour fault must never break chat
+        logger.error(f"Behaviour router failure: {exc}", exc_info=True)
+        return None
+
+
+async def _finalize_behaviour_turn(result, active_session, current_user, req, language: str):
+    from fastapi.concurrency import run_in_threadpool
+
+    def _work():
+        patient_id = active_session.patient_id or current_user.patient_id
+        with get_sync_db() as sdb:
+            PatientBehaviourRouter.finalize_turn(
+                sdb, result,
+                session_id=active_session.id,
+                patient_id=patient_id,
+                case_id=req.case_id or active_session.case_id or result.case_id,
+                channel=req.channel or "in_app_chat",
+                language=language if language in ("en", "es", "ar") else "en",
+            )
+
+    try:
+        await run_in_threadpool(_work)
+    except Exception as exc:
+        logger.error(f"Behaviour finalize failure: {exc}", exc_info=True)
 
 
 async def generate_agent_stream(
@@ -256,6 +307,7 @@ async def generate_agent_stream(
 
             msg_lower = req.message.lower().strip()
             tool_observations: List[Dict[str, Any]] = []
+            behaviour_result: Optional[BehaviourResult] = None
             draft_response = ""
             primary_intent = "general_inquiry"
             detected_language = "en"
@@ -427,6 +479,12 @@ async def generate_agent_stream(
                         "2. **Tomorrow at 2:30 PM** (Afternoon)\n\n"
                         "Which time works best for you?"
                     )
+                elif (behaviour_result := await _run_behaviour_turn(
+                    current_user, active_session, req, detected_language
+                )) is not None:
+                    primary_intent = behaviour_result.intent
+                    draft_response = behaviour_result.reply
+                    tool_observations.extend(behaviour_result.tool_observations)
                 elif len(msg_lower.split()) <= 2 and msg_lower not in ("hello", "hi", "hey") and not any(k in msg_lower for k in ["book", "report", "result", "doctor", "pain", "ride", "stage", "journey", "where"]):
                     # Low confidence ambiguous input: ask one short clarifying question, never default to booking
                     primary_intent = "clarification_needed"
@@ -528,21 +586,37 @@ async def generate_agent_stream(
                 await asyncio.sleep(0.015)
 
             # Record Outbound Communication
-            out_comm = Communication(
-                id=uuid.uuid4(),
-                user_id=current_user.user_id,
-                role=user_role,
-                case_id=req.case_id,
-                patient_id=active_session.patient_id,
-                session_id=active_session.id,
-                sender="ai",
-                channel=req.channel or "in_app_chat",
-                language=detected_language,
-                content=guarded_text,
-                acknowledged=True,
-                sent_at=datetime.now(timezone.utc)
-            )
-            db.add(out_comm)
+            if behaviour_result is not None:
+                # Behaviour turns persist the FULL reply first, then run post-delivery actions
+                # (e.g. complete Stage 4 only after the explanation text is durable).
+                guarded_behaviour = BehaviourResult(
+                    reply=guarded_text, intent=behaviour_result.intent,
+                    tool_observations=behaviour_result.tool_observations,
+                    post_delivery=behaviour_result.post_delivery,
+                    escalated=behaviour_result.escalated, case_id=behaviour_result.case_id,
+                )
+                await db.commit()
+                await _finalize_behaviour_turn(
+                    guarded_behaviour, active_session, current_user, req, detected_language
+                )
+                tool_observations = guarded_behaviour.tool_observations
+                out_comm = None
+            else:
+                out_comm = Communication(
+                    id=uuid.uuid4(),
+                    user_id=current_user.user_id,
+                    role=user_role,
+                    case_id=req.case_id,
+                    patient_id=active_session.patient_id,
+                    session_id=active_session.id,
+                    sender="ai",
+                    channel=req.channel or "in_app_chat",
+                    language=detected_language,
+                    content=guarded_text,
+                    acknowledged=True,
+                    sent_at=datetime.now(timezone.utc)
+                )
+                db.add(out_comm)
 
             # -------------------------------------------------------------
             # Auto Title Generation (After first exchange)

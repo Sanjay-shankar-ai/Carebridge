@@ -17,6 +17,7 @@ from app.models.workflow_trace import WorkflowExecutionTrace
 from app.models.notification import Notification
 from app.models.doctor_assignment import DoctorAssignment
 from app.models.case_lifecycle_stage import CaseLifecycleStage
+from app.models.transport import TransportRequest, ConversationFlowState
 
 __all__ = [
     "User",
@@ -38,4 +39,6 @@ __all__ = [
     "Notification",
     "DoctorAssignment",
     "CaseLifecycleStage",
+    "TransportRequest",
+    "ConversationFlowState",
 ]

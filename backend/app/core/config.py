@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     LANGCHAIN_ENDPOINT: str = "https://api.smith.langchain.com"
     LANGCHAIN_API_KEY: str = ""
 
+    # AI behaviour settings (transport, proactive follow-up)
+    TRANSPORT_LEAD_MINUTES: int = 60
+    FOLLOWUP_UPCOMING_HOURS: int = 24
+    FOLLOWUP_SOON_HOURS: int = 2
+    FOLLOWUP_MISSED_GRACE_MINUTES: int = 30
+    FOLLOWUP_QUIET_HOURS_START: int = 21
+    FOLLOWUP_QUIET_HOURS_END: int = 8
+    FOLLOWUP_TIMEZONE_OFFSET_MINUTES: int = 330  # local time = UTC + offset (default IST)
+    RECOVERY_REENGAGE_SLA_HOURS: int = 24
+
     @field_validator("SECRET_KEY")
     @classmethod
     def validate_secret_key(cls, v: str, info) -> str:

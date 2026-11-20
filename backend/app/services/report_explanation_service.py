@@ -314,7 +314,8 @@ class ReportExplanationService:
         case_id: uuid.UUID,
         language: str = "en",
         actor_role: str = "ai_coordinator",
-        actor_id: str = "carebridge-ai-counsellor"
+        actor_id: str = "carebridge-ai-counsellor",
+        complete_stage: bool = True
     ) -> Dict[str, Any]:
         """
         Executes complete Task 4 plain-language report explanation:
@@ -345,7 +346,7 @@ class ReportExplanationService:
                 if isinstance(sr.raw_report_data, dict):
                     raw_text = sr.raw_report_data.get("report_text") or sr.raw_report_data.get("extracted_text") or raw_text
 
-        ctx = care_case.case_context or {}
+        ctx = dict(care_case.case_context or {})
         staged = ctx.get("staged_report", {})
         if staged and staged.get("extracted_text"):
             raw_text = staged.get("extracted_text")
@@ -403,36 +404,120 @@ class ReportExplanationService:
         care_case.case_context = dict(ctx)
         db.commit()
 
-        # 5. Check if Stage 4 is already completed (idempotency check)
-        stages = LifecycleService.get_lifecycle_stages(care_case)
-        stage_4 = next((s for s in stages if s.get("stage_number") == 4), None)
-        stage_4_already_done = stage_4 and stage_4.get("status") == "completed"
-
-        if not stage_4_already_done:
-            evidence = {
-                "evidence_type": "patient_understanding",
-                "report_id": str(report_id or care_case.id),
-                "version": "1.0",
-                "language": language,
-                "sources": explanation_data["matched_glossary_ids"],
-                "delivered": True
-            }
-            try:
-                LifecycleService.advance_stage(
-                    db=db,
-                    case_id=care_case.id,
-                    stage_ident=4,
-                    actor_role=actor_role,
-                    actor_id=actor_id,
-                    evidence=evidence,
-                    notes="Delivered plain-language clinical report explanation (Grade 6-8 counselling structure)."
-                )
-            except Exception as e:
-                logger.warning(f"Notice during Stage 4 lifecycle advance: {e}")
+        # 5. Stage 4 handling
+        stage_4_completed = False
+        if complete_stage:
+            stage_4_completed = cls._advance_stage_4(
+                db, care_case, report_id, language, explanation_data["matched_glossary_ids"], actor_role, actor_id
+            )
 
         return {
             "success": True,
             "case_id": str(care_case.id),
-            "stage_4_completed": True,
+            "stage_4_completed": stage_4_completed,
             "data": explanation_data
         }
+
+    @classmethod
+    def _advance_stage_4(
+        cls, db, care_case, report_id, language, sources, actor_role, actor_id
+    ) -> bool:
+        """Idempotently completes Stage 4 (PATIENT_UNDERSTANDS) through the lifecycle service."""
+        from app.services.lifecycle_service import LifecycleService
+
+        stages = LifecycleService.get_lifecycle_stages(care_case)
+        stage_4 = next((s for s in stages if s.get("stage_number") == 4), None)
+        if stage_4 and stage_4.get("status") == "completed":
+            return True
+        evidence = {
+            "evidence_type": "patient_understanding",
+            "report_id": str(report_id or care_case.id),
+            "version": "1.0",
+            "language": language,
+            "sources": sources,
+            "delivered": True
+        }
+        try:
+            LifecycleService.advance_stage(
+                db=db,
+                case_id=care_case.id,
+                stage_ident=4,
+                actor_role=actor_role,
+                actor_id=actor_id,
+                evidence=evidence,
+                notes="Delivered plain-language clinical report explanation (Grade 6-8 counselling structure)."
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Notice during Stage 4 lifecycle advance: {e}")
+            return False
+
+    @classmethod
+    def is_report_finalized(cls, care_case) -> bool:
+        """A report is FINALIZED once lifecycle Stage 2 (diagnostic report generated) is completed."""
+        from app.services.lifecycle_service import LifecycleService
+        stages = LifecycleService.get_lifecycle_stages(care_case)
+        stage_2 = next((s for s in stages if s.get("stage_number") == 2), None)
+        return bool(stage_2 and stage_2.get("status") == "completed")
+
+    @classmethod
+    def explain_report(cls, db: Session, patient_id, language: str = "en") -> Dict[str, Any]:
+        """
+        Tool `explain_report(patient_id)` (B1). Reads the FINALIZED report, builds the structured
+        summary and plain-language sections. Does NOT complete Stage 4; call mark_delivered()
+        after the full reply text has been persisted.
+        Returns {success, state, ...}; state is one of ready | not_finalized | unreadable | no_case.
+        """
+        from app.models.care_case import CareCase
+
+        pid = patient_id if isinstance(patient_id, uuid.UUID) else uuid.UUID(str(patient_id))
+        care_case = (
+            db.query(CareCase).filter(CareCase.patient_id == pid).order_by(CareCase.created_at.desc()).first()
+        )
+        if not care_case:
+            return {"success": False, "state": "no_case", "error": "No care case found for this patient."}
+        if not cls.is_report_finalized(care_case):
+            return {
+                "success": False, "state": "not_finalized", "case_id": str(care_case.id),
+                "error": "The report is not finalized yet."
+            }
+        res = cls.generate_explanation(db, care_case.id, language=language, complete_stage=False)
+        if not res.get("success"):
+            return {"success": False, "state": "unreadable", "case_id": str(care_case.id), "error": res.get("error")}
+        res["state"] = "ready"
+        return res
+
+    @classmethod
+    def mark_delivered(
+        cls, db: Session, case_id, language: str = "en",
+        actor_role: str = "ai_coordinator", actor_id: str = "carebridge-ai-counsellor"
+    ) -> Dict[str, Any]:
+        """
+        Marks the explanation delivered and completes Stage 4 ONLY IF the full explanation text
+        has already been persisted as an AI Communication for this case.
+        """
+        from app.models.care_case import CareCase
+        from app.models.communication import Communication
+
+        cid = case_id if isinstance(case_id, uuid.UUID) else uuid.UUID(str(case_id))
+        care_case = db.query(CareCase).filter(CareCase.id == cid).first()
+        if not care_case:
+            return {"success": False, "stage_4_completed": False, "error": "Case not found"}
+        expl = (care_case.case_context or {}).get("report_explanation") or {}
+        full_text = (expl.get("full_text") or "").strip()
+        if not full_text:
+            return {"success": False, "stage_4_completed": False, "error": "No explanation prepared"}
+        persisted = (
+            db.query(Communication)
+            .filter(Communication.case_id == cid, Communication.sender == "ai_coordinator")
+            .order_by(Communication.sent_at.desc())
+            .limit(20)
+            .all()
+        )
+        if not any(full_text in (c.content or "") for c in persisted):
+            return {"success": False, "stage_4_completed": False, "error": "Explanation text not persisted yet"}
+        done = cls._advance_stage_4(
+            db, care_case, expl.get("report_id"), language, expl.get("sources", []), actor_role, actor_id
+        )
+        db.commit()
+        return {"success": True, "stage_4_completed": done}
