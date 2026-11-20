@@ -560,12 +560,25 @@ async def generate_agent_stream(
 
             # -------------------------------------------------------------
             # Response Guard Validation
-            # Guarantees that unverified action claims are sanitized before token emission.
+            # Guarantees that unverified action claims are sanitized before token emission,
+            # and prevents two consecutive replies from starting with the same sentence.
             # -------------------------------------------------------------
+            prev_ai_stmt = (
+                select(Communication)
+                .where(
+                    Communication.session_id == active_session.id,
+                    Communication.sender.in_(("ai", "ai_coordinator")),
+                )
+                .order_by(Communication.sent_at.desc())
+                .limit(1)
+            )
+            prev_ai_comm = (await db.execute(prev_ai_stmt)).scalars().first()
             guarded_text = ResponseGuardService.sanitize_response(
                 draft_response,
                 tool_observations=tool_observations,
-                actor_role=user_role
+                actor_role=user_role,
+                previous_reply=prev_ai_comm.content if prev_ai_comm else None,
+                language=detected_language,
             )
 
             # Check for cancellation before token streaming

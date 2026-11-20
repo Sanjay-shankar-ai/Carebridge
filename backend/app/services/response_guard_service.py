@@ -106,15 +106,58 @@ class ResponseGuardService:
         return False
 
     @classmethod
+    def _first_sentence(cls, text: Optional[str]) -> str:
+        s = (text or "").strip()
+        if not s:
+            return ""
+        m = re.match(r"([^\n.!?]+[.!?]?)", s)
+        return (m.group(1) if m else s).strip()
+
+    @classmethod
+    def deduplicate_opening_sentence(
+        cls,
+        draft: str,
+        previous_reply: Optional[str] = None,
+        language: str = "en",
+    ) -> str:
+        """
+        Guarantees two consecutive assistant replies never start with the exact same sentence.
+        """
+        if not draft or not previous_reply:
+            return draft
+        cur_first = cls._first_sentence(draft)
+        prev_first = cls._first_sentence(previous_reply)
+        if not cur_first or not prev_first:
+            return draft
+        norm_cur = re.sub(r"\s+", " ", cur_first.lower()).strip(" .!?")
+        norm_prev = re.sub(r"\s+", " ", prev_first.lower()).strip(" .!?")
+        if norm_cur != norm_prev:
+            return draft
+
+        rest = draft[len(cur_first):].lstrip()
+        if language == "es":
+            alt = "Gracias por seguir compartiendo cómo se siente."
+        elif language == "ar":
+            alt = "شكراً لمتابعتكِ ومشاركتكِ هذه التفاصيل معي."
+        else:
+            alt = "Thank you for staying with this and sharing that with me."
+        if rest:
+            return f"{alt}\n\n{rest}" if "\n" in draft[: len(cur_first) + 3] else f"{alt} {rest}"
+        return f"{alt} {draft}"
+
+    @classmethod
     def sanitize_response(
         cls,
         draft_response: Optional[str],
         tool_observations: Optional[List[Dict[str, Any]]] = None,
-        actor_role: str = "patient"
+        actor_role: str = "patient",
+        previous_reply: Optional[str] = None,
+        language: str = "en",
     ) -> str:
         """
         Scans draft_response for action claims. If an action claim lacks
         matching tool execution evidence, rewrites the response with authentic status.
+        Also ensures two consecutive replies never start with the same sentence.
         """
         if not draft_response:
             return "How can I assist you with your care pathway today?"
@@ -134,6 +177,7 @@ class ResponseGuardService:
                         sanitized = cls._rewrite_ungrounded_claim(sanitized, category, actor_role)
                         break
 
+        sanitized = cls.deduplicate_opening_sentence(sanitized, previous_reply=previous_reply, language=language)
         return sanitized
 
     @classmethod

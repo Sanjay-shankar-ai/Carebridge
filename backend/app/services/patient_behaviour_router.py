@@ -208,6 +208,43 @@ class PatientBehaviourRouter:
         pid = patient_id if isinstance(patient_id, uuid.UUID) else uuid.UUID(str(patient_id))
         state = cls.get_state(db, session_id, user_id, role) if session_id else {}
 
+        # B1-B4 dispatch helper with automatic opening-sentence deduplication
+        result = cls._dispatch_turn(
+            db, pid=pid, user_id=user_id, role=role, session_id=session_id,
+            message=message, text=text, state=state, case_id=case_id, language=language,
+        )
+        if result is not None and session_id:
+            prev = (
+                db.query(Communication)
+                .filter(
+                    Communication.session_id == session_id,
+                    Communication.sender.in_(("ai", "ai_coordinator")),
+                )
+                .order_by(Communication.sent_at.desc())
+                .first()
+            )
+            if prev and prev.content:
+                from app.services.response_guard_service import ResponseGuardService
+                result.reply = ResponseGuardService.deduplicate_opening_sentence(
+                    result.reply, previous_reply=prev.content, language=language
+                )
+        return result
+
+    @classmethod
+    def _dispatch_turn(
+        cls,
+        db: Session,
+        *,
+        pid: uuid.UUID,
+        user_id,
+        role: str,
+        session_id,
+        message: str,
+        text: str,
+        state: Dict[str, Any],
+        case_id=None,
+        language: str = "en",
+    ) -> Optional[BehaviourResult]:
         # B4 (Severe distress / crisis) ALWAYS takes top priority — deterministic, no LLM required
         from app.agents.specialized.clinical_escalation_agent import ClinicalEscalationAgent
         if ClinicalEscalationAgent.evaluate_severe_distress(message):
