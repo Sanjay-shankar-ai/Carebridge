@@ -91,7 +91,7 @@ def get_client_ip(request: Request) -> str:
 
 def rate_limit_login(request: Request):
     """FastAPI dependency for login rate limiting."""
-    if request.headers.get("X-Bypass-Rate-Limit") == "1":
+    if os.environ.get("TESTING") == "true" or request.headers.get("X-Bypass-Rate-Limit") == "1":
         return
     client_ip = get_client_ip(request)
     login_rate_limiter.check(f"login_{client_ip}")
@@ -99,7 +99,7 @@ def rate_limit_login(request: Request):
 
 def rate_limit_agent(request: Request):
     """FastAPI dependency for AI agent rate limiting."""
-    if request.headers.get("X-Bypass-Rate-Limit") == "1":
+    if os.environ.get("TESTING") == "true" or request.headers.get("X-Bypass-Rate-Limit") == "1":
         return
     client_ip = get_client_ip(request)
     agent_rate_limiter.check(f"agent_{client_ip}")

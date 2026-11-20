@@ -32,40 +32,14 @@ from app.services.lifecycle_service import LifecycleService
 from app.services.report_explanation_service import ReportExplanationService, REVIEWED_GLOSSARY
 
 
-SYNTHETIC_MAMMOGRAM_TEXT = """METROPOLITAN COMPREHENSIVE BREAST CENTER
-1200 Healthcare Parkway, Medical District • Tel: (555) 019-2834 • Accredited Breast Imaging Center
-Patient Name: Meera Krishnan
-MRN: MRN-2026-0461
-Date of Birth: 1980-05-14 (Age: 46)
-Exam Date: November 17, 2026
-Referring Clinician: Dr. Arjun Menon, MD
-Accession: ACC-2026-8812
-
-STUDY TYPE
-Diagnostic Bilateral Digital Mammography with 3D Tomosynthesis (DBT) and Supplementary Right Breast Target Ultrasound.
-
-CLINICAL INDICATION
-Routine screening follow-up; patient reports 3-week history of mild localized fullness in right upper quadrant. No nipple discharge. Family history significant for maternal postmenopausal breast cancer.
-
-BREAST DENSITY
-Category C: Heterogeneously dense breast tissue, which may obscure small masses.
-
-FINDINGS
-Right Breast: There is an irregular, hypoechoic solid mass measuring 4.2 cm in greatest dimension with ill-defined, partially spiculated margins located in the upper outer quadrant at the 10:00 position, approximately 4 cm from the nipple. Associated fine, pleomorphic clustered microcalcifications are identified within and immediately adjacent to the mass. Targeted color Doppler ultrasound confirms internal vascularity.
-
-Left Breast: Normal parenchymal pattern without focal architectural distortion, suspicious mass, or suspicious microcalcifications.
-
-Axilla: Bilateral axillary lymph nodes show preserved fatty hila and normal cortical thickness with no radiologic evidence of adenopathy.
-
-IMPRESSION & ASSESSMENT
-4.2 cm dominant solid mass in right breast upper outer quadrant with clustered pleomorphic microcalcifications.
-BI-RADS CATEGORY 4: Suspicious Abnormality
-
-RECOMMENDATIONS
-1. Ultrasound-guided core needle tissue biopsy of the right breast 10:00 position mass is recommended for definitive histological characterization.
-2. Consultation with a breast surgical oncologist (Dr. Arjun Menon) within 14 days.
-3. Post-biopsy clip placement and verification mammogram.
-
+SYNTHETIC_MAMMOGRAM_TEXT = """SYNTHETIC DEMO REPORT - NOT A REAL PATIENT
+Patient: Meera Krishnan (synthetic)   Age: 46   Study: Bilateral screening mammogram (digital)
+Date: November 17, 2026   Referring: CareBridge demo clinic
+TECHNIQUE: Standard CC and MLO views of both breasts.
+BREAST COMPOSITION: Heterogeneously dense (category C).
+FINDINGS: Right breast, upper outer quadrant: irregular hyperdense mass measuring approximately 1.2 cm with spiculated margins and associated fine pleomorphic microcalcifications. No axillary lymphadenopathy identified. Left breast: no suspicious mass, calcification or architectural distortion.
+IMPRESSION: Suspicious right breast mass. BI-RADS Category 4.
+RECOMMENDATION: Ultrasound-guided core needle biopsy and clinical correlation.
 Interpreting Radiologist: Sunita Rao, MD (Board Certified Diagnostic Radiologist) • Finalized: 2026-11-18T10:30:00Z
 """
 
@@ -112,7 +86,7 @@ def test_case_stage3_done():
             screening_type="Mammogram",
             test_date=now - timedelta(days=2),
             finding_code="BI-RADS-4",
-            finding_summary="4.2 cm mass in right breast upper outer quadrant with microcalcifications.",
+            finding_summary="1.2 cm mass in right breast upper outer quadrant with microcalcifications.",
             urgency_level="urgent",
             performing_facility="Metropolitan Breast Center",
             raw_report_data={
@@ -243,15 +217,13 @@ def test_numbers_and_categories_match_source_exactly(test_case_stage3_done):
         summary = res["data"]["structured_summary"]
 
         # Match exact measurements and categories
-        assert "4.2 cm" in summary["findings"]
-        assert "4.2 cm" in summary["impression"]
-        assert "10:00 position" in summary["findings"]
+        assert "1.2 cm" in summary["findings"]
         assert "upper outer quadrant" in summary["findings"]
-        assert "Category C" in summary["breast_density"]
+        assert "category C" in summary["breast_density"] or "Category C" in summary["breast_density"]
         assert "Heterogeneously dense" in summary["breast_density"]
-        assert "BI-RADS CATEGORY 4" in summary["bi_rads_category"] or "BI-RADS 4" in summary["bi_rads_category"]
+        assert "BI-RADS Category 4" in summary["bi_rads_category"] or "BI-RADS 4" in summary["bi_rads_category"]
         assert "November 17, 2026" in summary["date"]
-        assert "core needle tissue biopsy" in summary["recommendation"].lower()
+        assert "core needle biopsy" in summary["recommendation"].lower()
 
 
 def test_unknown_clinical_term_flagged(test_case_stage3_done):

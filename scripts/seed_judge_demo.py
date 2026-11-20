@@ -151,16 +151,16 @@ def generate_synthetic_mammogram_pdf(target_path: Path):
         )
 
         story = []
-        story.append(Paragraph("METROPOLITAN COMPREHENSIVE BREAST CENTER", header_style))
-        story.append(Paragraph("1200 Healthcare Parkway, Medical District • Tel: (555) 019-2834 • Accredited Breast Imaging Center", sub_header))
+        story.append(Paragraph("SYNTHETIC DEMO REPORT - NOT A REAL PATIENT", header_style))
+        story.append(Paragraph("CareBridge Demo Clinic • Tel: (555) 019-2834 • Accredited Breast Screening Center", sub_header))
         story.append(Spacer(1, 10))
         story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor('#0F52BA'), spaceAfter=15))
 
         # Patient Info Table
         info_data = [
-            [Paragraph("<b>Patient Name:</b> Meera Krishnan", body_style), Paragraph("<b>MRN:</b> MRN-2026-0461", body_style)],
-            [Paragraph("<b>Date of Birth:</b> 1980-05-14 (Age: 46)", body_style), Paragraph("<b>Exam Date:</b> November 17, 2026", body_style)],
-            [Paragraph("<b>Referring Clinician:</b> Dr. Arjun Menon, MD", body_style), Paragraph("<b>Accession:</b> ACC-2026-8812", body_style)]
+            [Paragraph("<b>Patient:</b> Meera Krishnan (synthetic)", body_style), Paragraph("<b>Age:</b> 46", body_style)],
+            [Paragraph("<b>Study:</b> Bilateral screening mammogram (digital)", body_style), Paragraph("<b>Date:</b> November 17, 2026", body_style)],
+            [Paragraph("<b>Referring:</b> CareBridge demo clinic", body_style), Paragraph("<b>Accession:</b> ACC-2026-8812", body_style)]
         ]
         info_table = Table(info_data, colWidths=[260, 260])
         info_table.setStyle(TableStyle([
@@ -173,38 +173,25 @@ def generate_synthetic_mammogram_pdf(target_path: Path):
         story.append(Spacer(1, 15))
 
         # Report Sections
-        story.append(Paragraph("STUDY TYPE", section_style))
-        story.append(Paragraph("Diagnostic Bilateral Digital Mammography with 3D Tomosynthesis (DBT) and Supplementary Right Breast Target Ultrasound.", body_style))
+        story.append(Paragraph("TECHNIQUE", section_style))
+        story.append(Paragraph("Standard CC and MLO views of both breasts.", body_style))
 
-        story.append(Paragraph("CLINICAL INDICATION", section_style))
-        story.append(Paragraph("Routine screening follow-up; patient reports 3-week history of mild localized fullness in right upper quadrant. No nipple discharge. Family history significant for maternal postmenopausal breast cancer.", body_style))
-
-        story.append(Paragraph("BREAST DENSITY", section_style))
-        story.append(Paragraph("<b>Category C:</b> Heterogeneously dense breast tissue, which may obscure small masses.", body_style))
+        story.append(Paragraph("BREAST COMPOSITION", section_style))
+        story.append(Paragraph("Heterogeneously dense (category C).", body_style))
 
         story.append(Paragraph("FINDINGS", section_style))
         findings_text = (
-            "<b>Right Breast:</b> There is an irregular, hypoechoic solid mass measuring <b>4.2 cm</b> in greatest dimension "
-            "with ill-defined, partially spiculated margins located in the <b>upper outer quadrant</b> at the 10:00 position, "
-            "approximately 4 cm from the nipple. Associated fine, pleomorphic clustered microcalcifications are identified within "
-            "and immediately adjacent to the mass. Targeted color Doppler ultrasound confirms internal vascularity.<br/><br/>"
-            "<b>Left Breast:</b> Normal parenchymal pattern without focal architectural distortion, suspicious mass, or suspicious microcalcifications.<br/><br/>"
-            "<b>Axilla:</b> Bilateral axillary lymph nodes show preserved fatty hila and normal cortical thickness with no radiologic evidence of adenopathy."
+            "Right breast, upper outer quadrant: irregular hyperdense mass measuring approximately <b>1.2 cm</b> "
+            "with spiculated margins and associated fine pleomorphic microcalcifications. No axillary "
+            "lymphadenopathy identified. Left breast: no suspicious mass, calcification or architectural distortion."
         )
         story.append(Paragraph(findings_text, body_style))
 
-        story.append(Paragraph("IMPRESSION & ASSESSMENT", section_style))
-        story.append(Paragraph("4.2 cm dominant solid mass in right breast upper outer quadrant with clustered pleomorphic microcalcifications.", body_style))
-        story.append(Spacer(1, 5))
-        story.append(Paragraph("<b>BI-RADS CATEGORY 4: Suspicious Abnormality</b>", bold_alert))
+        story.append(Paragraph("IMPRESSION", section_style))
+        story.append(Paragraph("Suspicious right breast mass. <b>BI-RADS Category 4</b>.", bold_alert))
 
-        story.append(Paragraph("RECOMMENDATIONS", section_style))
-        recs = (
-            "1. <b>Ultrasound-guided core needle tissue biopsy</b> of the right breast 10:00 position mass is recommended for definitive histological characterization.<br/>"
-            "2. Consultation with a breast surgical oncologist (Dr. Arjun Menon) within 14 days.<br/>"
-            "3. Post-biopsy clip placement and verification mammogram."
-        )
-        story.append(Paragraph(recs, body_style))
+        story.append(Paragraph("RECOMMENDATION", section_style))
+        story.append(Paragraph("Ultrasound-guided core needle biopsy and clinical correlation.", body_style))
         story.append(Spacer(1, 15))
 
         story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor('#9CA3AF'), spaceAfter=10))
@@ -447,13 +434,13 @@ def seed_judge_demo():
         ).scalar_one_or_none()
 
         report_raw_data = {
-            "study_type": "Diagnostic Bilateral Digital Mammogram with 3D Tomosynthesis",
+            "study_type": "Bilateral screening mammogram (digital)",
             "date": (now - timedelta(days=3)).strftime("%Y-%m-%d"),
-            "breast_density": "Heterogeneously dense (Category C)",
-            "findings": "4.2 cm irregular hypoechoic mass with ill-defined margins and clustered pleomorphic microcalcifications in upper outer quadrant of right breast at 10 o'clock position, 4 cm from nipple.",
-            "impression": "Suspicious right breast mass with associated microcalcifications.",
+            "breast_density": "Heterogeneously dense (category C).",
+            "findings": "Right breast, upper outer quadrant: irregular hyperdense mass measuring approximately 1.2 cm with spiculated margins and associated fine pleomorphic microcalcifications. No axillary lymphadenopathy identified. Left breast: no suspicious mass, calcification or architectural distortion.",
+            "impression": "Suspicious right breast mass. BI-RADS Category 4.",
             "bi_rads_category": "BI-RADS Category 4",
-            "recommendation": "Ultrasound-guided core needle tissue biopsy and clinical consultation with breast surgical oncologist within 14 days.",
+            "recommendation": "Ultrasound-guided core needle biopsy and clinical correlation.",
             "report_filename": "meera_krishnan_mammogram_report.pdf",
             "report_pdf_path": pdf_rel_path,
             "uploaded_by": "Priya Nair, RN",
@@ -469,16 +456,16 @@ def seed_judge_demo():
                 screening_type="Mammogram",
                 test_date=now - timedelta(days=3),
                 finding_code="BI-RADS-4",
-                finding_summary="4.2cm irregular hypoechoic mass with clustered pleomorphic microcalcifications in upper outer quadrant of right breast. Ultrasound-guided core biopsy strongly indicated.",
+                finding_summary="Right breast, upper outer quadrant: irregular hyperdense mass measuring approximately 1.2 cm with spiculated margins and fine pleomorphic microcalcifications. BI-RADS Category 4.",
                 urgency_level="urgent",
-                performing_facility="Metropolitan Breast Screening Center",
+                performing_facility="CareBridge Demo Clinic",
                 raw_report_data=report_raw_data
             )
             db.add(screening_meera)
             db.flush()
         else:
             screening_meera.raw_report_data = report_raw_data
-            screening_meera.finding_summary = "4.2cm irregular hypoechoic mass with clustered pleomorphic microcalcifications in upper outer quadrant of right breast. Ultrasound-guided core biopsy strongly indicated."
+            screening_meera.finding_summary = "Right breast, upper outer quadrant: irregular hyperdense mass measuring approximately 1.2 cm with spiculated margins and fine pleomorphic microcalcifications. BI-RADS Category 4."
             db.flush()
 
         # Care Case
@@ -504,7 +491,7 @@ def seed_judge_demo():
                     "assigned_doctor_id": str(doctor_owner.id),
                     "doctor_name": "Dr. Arjun Menon, MD",
                     "specialty": "Breast Oncology",
-                    "facility": "Metropolitan Breast & Comprehensive Cancer Center",
+                    "facility": "CareBridge Demo Clinic",
                     "screening_type": "Mammogram",
                     "finding_code": "BI-RADS-4",
                     "finding_summary": screening_meera.finding_summary,
@@ -512,8 +499,8 @@ def seed_judge_demo():
                     "recovery_attempts": 0,
                     "patient_understanding_confirmed": False,
                     "notes": [
-                        f"Day 0: Screening performed at Metropolitan Breast Screening Center.",
-                        f"Day 1: Diagnostic report uploaded, validated and finalized (BI-RADS 4, 4.2cm mass).",
+                        f"Day 0: Screening performed at CareBridge demo clinic.",
+                        f"Day 1: Diagnostic report uploaded, validated and finalized (BI-RADS 4, 1.2 cm mass).",
                         f"Day 2: Assigned to Dr. Arjun Menon, MD for Breast Oncology review.",
                         f"Day 2: Plain-language results notification dispatched to patient via SMS."
                     ]

@@ -113,19 +113,19 @@ class ReportExplanationService:
 
         # 1. Study Type
         study_m = re.search(
-            r"STUDY TYPE\s*\n\s*(.*?)(?=\n\s*(?:CLINICAL INDICATION|BREAST DENSITY|FINDINGS|IMPRESSION|RECOMMENDATION|BI-RADS|$))",
+            r"(?:STUDY TYPE\s*\n\s*|Study:\s*)(.*?)(?=\n\s*(?:CLINICAL INDICATION|BREAST COMPOSITION|BREAST DENSITY|TECHNIQUE|FINDINGS|IMPRESSION|RECOMMENDATION|BI-RADS|$)|Date|\s*Referring)",
             raw_text,
             re.DOTALL | re.IGNORECASE
         )
         study_type = " ".join(study_m.group(1).split()) if study_m else None
 
         # 2. Date
-        date_m = re.search(r"(?:Exam Date|Date of Exam|Date):\s*([^\n\r]+)", raw_text, re.IGNORECASE)
+        date_m = re.search(r"(?:Exam Date|Date of Exam|Date):\s*([^\n\r]+?)(?=\s*Referring|$)", raw_text, re.IGNORECASE)
         exam_date = date_m.group(1).strip() if date_m else None
 
-        # 3. Breast Density
+        # 3. Breast Density / Composition
         density_m = re.search(
-            r"BREAST DENSITY\s*\n\s*(.*?)(?=\n\s*(?:FINDINGS|IMPRESSION|RECOMMENDATION|BI-RADS|$))",
+            r"(?:BREAST DENSITY\s*\n\s*|BREAST COMPOSITION:?\s*)(.*?)(?=\n\s*(?:FINDINGS|IMPRESSION|RECOMMENDATION|BI-RADS|$))",
             raw_text,
             re.DOTALL | re.IGNORECASE
         )
@@ -133,7 +133,7 @@ class ReportExplanationService:
 
         # 4. Findings
         findings_m = re.search(
-            r"FINDINGS\s*\n\s*(.*?)(?=\n\s*(?:IMPRESSION|RECOMMENDATION|BI-RADS|$))",
+            r"FINDINGS:?\s*(.*?)(?=\n\s*(?:IMPRESSION|RECOMMENDATION|BI-RADS|$))",
             raw_text,
             re.DOTALL | re.IGNORECASE
         )
@@ -141,7 +141,7 @@ class ReportExplanationService:
 
         # 5. Impression
         imp_m = re.search(
-            r"IMPRESSION(?:\s*&?\s*ASSESSMENT)?:?\s*\n\s*(.*?)(?=\n\s*(?:BI-RADS|RECOMMENDATION|$))",
+            r"IMPRESSION(?:\s*&?\s*ASSESSMENT)?:?\s*(.*?)(?=\n\s*(?:BI-RADS|RECOMMENDATION|$))",
             raw_text,
             re.DOTALL | re.IGNORECASE
         )
@@ -157,7 +157,7 @@ class ReportExplanationService:
 
         # 7. Recommendations
         rec_m = re.search(
-            r"RECOMMENDATIONS?:?\s*\n\s*(.*?)(?=\n\s*(?:Interpreting Radiologist|SIGNATURE|BI-RADS|$))",
+            r"RECOMMENDATIONS?:?\s*(.*?)(?=(?:\n\s*(?:Interpreting Radiologist|SIGNATURE|BI-RADS))|\Z)",
             raw_text,
             re.DOTALL | re.IGNORECASE
         )
