@@ -323,6 +323,31 @@ class AppointmentService:
         except Exception as sync_err:
             logger.warning(f"Transport resync notice on reschedule: {sync_err}")
 
+        # Notify assigned doctor of the rescheduled version
+        try:
+            from app.services.notification_service import NotificationService
+            new_utc = new_scheduled_time.replace(tzinfo=timezone.utc) if new_scheduled_time.tzinfo is None else new_scheduled_time.astimezone(timezone.utc)
+            for d_user in NotificationService.get_assigned_doctor_users(db, appt.case_id, provider_name=appt.provider_name):
+                NotificationService.stage_notification(
+                    db=db,
+                    user_id=d_user.id,
+                    role=d_user.role,
+                    event_type="appointment_rescheduled",
+                    title="Appointment Rescheduled — Confirmation Needed",
+                    message=(
+                        f"Appointment moved to {new_utc.strftime('%Y-%m-%d %H:%M UTC')} "
+                        f"(v{appt.version}). Reason: {reason or 'Schedule update'}. Please confirm."
+                    ),
+                    priority="normal",
+                    case_id=appt.case_id,
+                    patient_id=appt.patient_id,
+                    action_link=f"/cases/{appt.case_id}",
+                    idempotency_key=f"appt_resched_doc_{d_user.id}_{appt.id}_v{appt.version}",
+                    metadata_json={"appointment_id": str(appt.id), "version": appt.version},
+                )
+        except Exception as notif_err:
+            logger.warning(f"Doctor reschedule notification notice: {notif_err}")
+
         return appt
 
     @classmethod
@@ -389,3 +414,262 @@ class AppointmentService:
         )
 
         return appt
+
+    @classmethod
+    def get_available_slots(
+        cls,
+        db: Session,
+        doctor: Any,
+        constraints: Optional[Dict[str, Any]] = None,
+        limit: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """
+        Tool `get_available_slots(doctor, constraints)` (B3).
+        Returns up to `limit` REAL slots from the doctor's persisted schedule_slots in PostgreSQL,
+        excluding past times and colliding appointments. NEVER invents slots.
+        """
+        from app.models.owner import CaseOwner
+
+        constraints = constraints or {}
+        doc_owner = None
+        if isinstance(doctor, CaseOwner):
+            doc_owner = doctor
+        else:
+            doc_str = str(doctor or "").strip()
+            try:
+                doc_uuid = uuid.UUID(doc_str)
+                doc_owner = db.query(CaseOwner).filter(CaseOwner.id == doc_uuid).first()
+            except (ValueError, TypeError):
+                doc_owner = None
+            if not doc_owner and doc_str:
+                doc_owner = db.query(CaseOwner).filter(CaseOwner.name == doc_str).first()
+            if not doc_owner and doc_str:
+                doc_owner = db.query(CaseOwner).filter(CaseOwner.name.ilike(f"%{doc_str}%")).first()
+
+        if not doc_owner or not doc_owner.is_active or doc_owner.on_leave:
+            return []
+
+        raw_slots = (doc_owner.working_hours or {}).get("schedule_slots") or []
+        if not raw_slots:
+            return []
+
+        now = datetime.now(timezone.utc)
+        time_of_day = (constraints.get("time_of_day") or "").lower().strip()
+        wanted_days = [d.lower().strip() for d in (constraints.get("days") or []) if d]
+        weekday_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+        active_statuses = (
+            "PROPOSED", "PENDING_DOCTOR_CONFIRMATION", "PENDING_PATIENT_CONFIRMATION",
+            "CONFIRMED", "RESCHEDULE_REQUESTED", "booked", "confirmed",
+        )
+        booked = (
+            db.query(Appointment)
+            .filter(
+                Appointment.provider_name == doc_owner.name,
+                Appointment.status.in_(active_statuses),
+                Appointment.scheduled_time >= now - timedelta(hours=1),
+            )
+            .all()
+        )
+        booked_times = [
+            b.scheduled_time.replace(tzinfo=timezone.utc) if b.scheduled_time.tzinfo is None else b.scheduled_time.astimezone(timezone.utc)
+            for b in booked
+        ]
+
+        results: List[Dict[str, Any]] = []
+        for s in raw_slots:
+            try:
+                dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+            except Exception:
+                continue
+
+            if dt <= now + timedelta(minutes=15):
+                continue
+
+            if any(abs((dt - bt).total_seconds()) < 1800 for bt in booked_times):
+                continue
+
+            day_name = weekday_names[dt.weekday()]
+            if wanted_days:
+                if "weekend" in wanted_days and day_name not in ("saturday", "sunday"):
+                    continue
+                if "weekday" in wanted_days and day_name in ("saturday", "sunday"):
+                    continue
+                explicit_days = [d for d in wanted_days if d in weekday_names]
+                if explicit_days and day_name not in explicit_days:
+                    continue
+
+            hour = dt.hour
+            if time_of_day == "morning" and not (6 <= hour < 12):
+                continue
+            if time_of_day == "afternoon" and not (12 <= hour < 17):
+                continue
+            if time_of_day == "evening" and not (17 <= hour <= 22):
+                continue
+
+            results.append({
+                "iso": dt.isoformat(),
+                "display": dt.strftime("%A %Y-%m-%d at %H:%M UTC"),
+                "hhmm": dt.strftime("%H:%M"),
+                "day": day_name,
+                "provider_name": doc_owner.name,
+                "facility": doc_owner.facility,
+            })
+            if len(results) >= limit:
+                break
+
+        return results
+
+    @classmethod
+    def cancel_appointment(
+        cls,
+        db: Session,
+        appointment_id: Any,
+        reason: str,
+        *,
+        reason_category: Optional[str] = None,
+        patient_id: Optional[Any] = None,
+        actor_role: str = "patient",
+        actor_id: str = "patient",
+    ) -> Dict[str, Any]:
+        """
+        Cancels an appointment -> status CANCELLED, stores cancellation_reason, notifies doctor AND
+        coordinator through the outbox, opens a Recovery Agent task within SLA, cancels linked
+        transport, and NEVER closes a case or completes a lifecycle stage.
+        """
+        from app.core.config import settings
+        from app.models.transport import TransportRequest
+        from app.services.notification_service import NotificationService
+        from app.services.task_service import TaskService
+
+        appt_uuid = appointment_id if isinstance(appointment_id, uuid.UUID) else uuid.UUID(str(appointment_id))
+        appt = db.query(Appointment).filter(Appointment.id == appt_uuid).first()
+        if not appt:
+            return {"success": False, "error": f"Appointment {appointment_id} not found."}
+
+        if patient_id is not None:
+            pid = patient_id if isinstance(patient_id, uuid.UUID) else uuid.UUID(str(patient_id))
+            if appt.patient_id != pid:
+                raise PermissionError("Forbidden: Cannot cancel another patient's appointment.")
+
+        now = datetime.now(timezone.utc)
+        prev_status = appt.status
+        stored_reason = f"{reason_category}: {reason}" if (reason_category and reason_category not in reason.lower()) else reason
+        appt.status = "CANCELLED"
+        appt.cancellation_reason = stored_reason
+        appt.cancellation_outcome = "recovery_pending"
+
+        active_trs = (
+            db.query(TransportRequest)
+            .filter(
+                TransportRequest.appointment_id == appt.id,
+                TransportRequest.status.in_(("REQUESTED", "CONFIRMED")),
+            )
+            .all()
+        )
+        for tr in active_trs:
+            tr.status = "CANCELLED"
+
+        case = db.query(CareCase).filter(CareCase.id == appt.case_id).first()
+        patient = db.query(Patient).filter(Patient.id == appt.patient_id).first()
+        p_name = f"{patient.first_name} {patient.last_name}" if patient else "Patient"
+
+        if case:
+            ctx = dict(case.case_context or {})
+            hist = list(ctx.get("cancellation_history") or [])
+            hist.append({
+                "appointment_id": str(appt.id),
+                "cancelled_at": now.isoformat(),
+                "reason_category": reason_category or "other",
+                "reason": stored_reason,
+                "previous_status": prev_status,
+            })
+            ctx["cancellation_history"] = hist
+            case.case_context = ctx
+
+        recovery_task = TaskService.create_recovery_task(
+            db=db,
+            case_id=appt.case_id,
+            patient_id=appt.patient_id,
+            barrier_type=reason_category or "appointment_cancelled",
+            barrier_description=(
+                f"Appointment {appt.id} was cancelled by {actor_role}. Reason: {stored_reason}. "
+                f"Re-engage patient within {settings.RECOVERY_REENGAGE_SLA_HOURS}h SLA."
+            ),
+            idempotency_key=f"recovery_cancel_{appt.id}_v{appt.version}",
+            priority="urgent",
+        )
+        recovery_task.due_date = now + timedelta(hours=settings.RECOVERY_REENGAGE_SLA_HOURS)
+
+        for c_user in NotificationService.get_coordinator_users(db):
+            NotificationService.stage_notification(
+                db=db,
+                user_id=c_user.id,
+                role="care_coordinator",
+                event_type="appointment_cancelled",
+                title="Appointment Cancelled — Recovery Needed",
+                message=f"{p_name} cancelled their appointment. Reason: {stored_reason}. Recovery task opened.",
+                priority="urgent",
+                case_id=appt.case_id,
+                patient_id=appt.patient_id,
+                action_link=f"/cases/{appt.case_id}",
+                idempotency_key=f"cancel_coord_{c_user.id}_{appt.id}_v{appt.version}",
+                metadata_json={"appointment_id": str(appt.id), "reason": stored_reason},
+            )
+
+        for d_user in NotificationService.get_assigned_doctor_users(db, appt.case_id, provider_name=appt.provider_name):
+            NotificationService.stage_notification(
+                db=db,
+                user_id=d_user.id,
+                role=d_user.role,
+                event_type="appointment_cancelled",
+                title="Patient Appointment Cancelled",
+                message=f"Appointment for {p_name} has been cancelled. Reason: {stored_reason}.",
+                priority="normal",
+                case_id=appt.case_id,
+                patient_id=appt.patient_id,
+                action_link=f"/cases/{appt.case_id}",
+                idempotency_key=f"cancel_doc_{d_user.id}_{appt.id}_v{appt.version}",
+                metadata_json={"appointment_id": str(appt.id), "reason": stored_reason},
+            )
+
+        db.add(CaseEvent(
+            id=uuid.uuid4(),
+            case_id=appt.case_id,
+            event_type="appointment_cancelled",
+            description=f"Appointment {appt.id} cancelled ({stored_reason}). Doctor and coordinator notified; recovery task opened.",
+            event_data={
+                "appointment_id": str(appt.id),
+                "reason_category": reason_category or "other",
+                "reason": stored_reason,
+                "recovery_task_id": str(recovery_task.id),
+            },
+            timestamp=now,
+        ))
+        db.add(AuditLog(
+            id=uuid.uuid4(),
+            case_id=appt.case_id,
+            patient_id=appt.patient_id,
+            actor_type=actor_role,
+            actor_id=str(actor_id),
+            action="CANCEL_APPOINTMENT",
+            autonomy_level=2,
+            rationale=f"Cancelled appointment {appt.id} after explicit patient confirmation. Reason: {stored_reason}.",
+            previous_state={"status": prev_status},
+            new_state={"status": "CANCELLED", "reason": stored_reason, "recovery_task_id": str(recovery_task.id)},
+            timestamp=now,
+        ))
+        db.commit()
+
+        return {
+            "success": True,
+            "appointment_id": str(appt.id),
+            "status": "CANCELLED",
+            "cancellation_reason": stored_reason,
+            "reason_category": reason_category or "other",
+            "recovery_task_id": str(recovery_task.id),
+        }

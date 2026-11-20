@@ -121,7 +121,20 @@ class NotificationService:
                         .filter(DoctorAssignment.case_id == case_id, DoctorAssignment.doctor_id == user.owner_id)
                         .first() is not None
                     )
-                    if not (is_owner or has_assignment):
+                    is_appt_provider = False
+                    if user.owner_id and not (is_owner or has_assignment):
+                        from app.models.owner import CaseOwner
+                        owner_rec = db.query(CaseOwner).filter(CaseOwner.id == user.owner_id).first()
+                        if owner_rec:
+                            is_appt_provider = (
+                                db.query(Appointment)
+                                .filter(
+                                    Appointment.case_id == case_id,
+                                    Appointment.provider_name == owner_rec.name,
+                                )
+                                .first() is not None
+                            )
+                    if not (is_owner or has_assignment or is_appt_provider):
                         raise RecipientAuthorizationError(
                             f"Doctor authorization violation: Doctor {user.id} is not assigned to Case {case_id}."
                         )
@@ -715,7 +728,56 @@ class NotificationService:
             )
             notifs.append(n)
 
+        # 3. Assigned Doctor Notification
+        appt = db.query(Appointment).filter(Appointment.id == appointment_id).first()
+        doc_users = cls.get_assigned_doctor_users(db, case_id, provider_name=appt.provider_name if appt else None)
+        for d_user in doc_users:
+            try:
+                n = cls.create_notification(
+                    db=db,
+                    user_id=d_user.id,
+                    role=d_user.role,
+                    event_type="appointment_cancelled",
+                    title="Patient Appointment Cancelled",
+                    message=f"Appointment for {patient_name or 'Patient'} was cancelled ({reason}).",
+                    priority="normal",
+                    case_id=case_id,
+                    patient_id=patient_id,
+                    action_link=f"/cases/{case_id}",
+                    idempotency_key=f"appt_cancelled_doc_{d_user.id}_{appointment_id}",
+                    metadata_json={"appointment_id": str(appointment_id), "reason": reason},
+                )
+                notifs.append(n)
+            except RecipientAuthorizationError:
+                pass
+
         return notifs
+
+    @classmethod
+    def get_assigned_doctor_users(
+        cls, db: Session, case_id: uuid.UUID, provider_name: Optional[str] = None
+    ) -> List[User]:
+        """Returns doctor User accounts authorized for a specific case (via owner, assignment, or provider_name)."""
+        from app.models.doctor_assignment import DoctorAssignment
+        from app.models.owner import CaseOwner
+
+        owner_ids = set()
+        case = db.query(CareCase).filter(CareCase.id == case_id).first()
+        if case and case.current_owner_id:
+            owner_ids.add(case.current_owner_id)
+        for da in db.query(DoctorAssignment).filter(DoctorAssignment.case_id == case_id).all():
+            owner_ids.add(da.doctor_id)
+        if provider_name:
+            prov = db.query(CaseOwner).filter(CaseOwner.name == provider_name).first()
+            if prov:
+                owner_ids.add(prov.id)
+        if not owner_ids:
+            return []
+        return (
+            db.query(User)
+            .filter(User.owner_id.in_(list(owner_ids)), User.role.in_(["doctor", "clinician"]))
+            .all()
+        )
 
     @classmethod
     def notify_appointment_reminder(

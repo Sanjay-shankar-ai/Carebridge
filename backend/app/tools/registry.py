@@ -1533,3 +1533,15 @@ class ToolRegistry:
             actor_role=actor_role,
             actor_id=actor_id,
         )
+
+    @classmethod
+    def get_available_slots(
+        cls,
+        db: Session,
+        doctor: Any,
+        constraints: Optional[Dict[str, Any]] = None,
+        limit: int = 3,
+    ) -> Dict[str, Any]:
+        from app.services.appointment_service import AppointmentService
+        slots = AppointmentService.get_available_slots(db, doctor=doctor, constraints=constraints, limit=limit)
+        return ToolExecutionResult(True, {"slots": slots}, f"Found {len(slots)} real available slot(s)", 1).to_dict()

@@ -55,6 +55,52 @@ COMPANION_NO_PATTERNS = [
     r"\balone\b", r"\bjust\s+me\b", r"\bno\s+(caregiver|companion|one)\b", r"\bby\s+myself\b", r"\bonly\s+me\b",
 ]
 
+CANCEL_PATTERNS = [
+    r"\bcancel\w*\s+(my\s+|the\s+)?(appointment|visit|consultation|booking)\b",
+    r"\bneed\s+to\s+cancel\b", r"\bwant\s+to\s+cancel\b", r"\bi\s+can(?:'t|not|t)\s+come\b",
+    r"\bcan(?:'t|not|t)\s+make\s+it\b", r"\bcancelar\s+mi\s+cita\b", r"\bno\s+puedo\s+ir\b",
+    r"\bإلغاء\s+موعدي\b", r"\bلا\s+أستطيع\s+الحضور\b",
+]
+
+EXPLICIT_CANCEL_CONFIRM_PATTERNS = [
+    r"\byes[\s,]+cancel\b", r"\bconfirm\s+cancel\w*\b", r"\bs[ií][\s,]+cancelar\b", r"\bنعم[\s،,]+إلغاء\b",
+]
+
+WEEKDAY_WORDS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "weekend", "weekday"]
+
+
+def _classify_cancel_reason(text: str) -> str:
+    if any(w in text for w in ["transport", "ride", "bus", "car", "drive", "travel", "no way to get", "no way to reach"]):
+        return "transport"
+    if any(w in text for w in ["cost", "money", "afford", "expensive", "pay", "insurance", "bill", "financial"]):
+        return "cost"
+    if any(w in text for w in ["scared", "afraid", "fear", "anxious", "anxiety", "nervous", "panic", "cancer", "die", "terrified", "worried"]):
+        return "fear_or_anxiety"
+    if any(w in text for w in ["sick", "ill", "fever", "pain", "bleed", "dizzy", "chest", "unwell", "flu", "cough", "nausea", "vomit", "symptom"]):
+        return "illness"
+    if any(w in text for w in ["daughter", "son", "husband", "wife", "child", "kids", "baby", "family", "caregiver", "mother", "father", "parent"]):
+        return "caregiver_or_family"
+    if any(w in text for w in ["work", "shift", "job", "meeting", "schedule", "busy", "office", "evening", "morning", "afternoon", "conflict"] + WEEKDAY_WORDS):
+        return "work_or_schedule"
+    return "other"
+
+
+def _parse_slot_constraints(text: str) -> Dict[str, Any]:
+    tod = None
+    if re.search(r"\bevening\w*\b|\bafter\s+(5|6|work)\b|\bnight\b", text):
+        tod = "evening"
+    elif re.search(r"\bmorning\w*\b|\b(?:am|early)\b", text):
+        tod = "morning"
+    elif re.search(r"\bafternoon\w*\b|\bmidday\b", text):
+        tod = "afternoon"
+    days = [d for d in WEEKDAY_WORDS if re.search(rf"\b{d}s?\b", text)]
+    constraints: Dict[str, Any] = {}
+    if tod:
+        constraints["time_of_day"] = tod
+    if days:
+        constraints["days"] = days
+    return constraints
+
 
 def _lead_phrase() -> str:
     from app.core.config import settings
@@ -154,18 +200,28 @@ class PatientBehaviourRouter:
         pid = patient_id if isinstance(patient_id, uuid.UUID) else uuid.UUID(str(patient_id))
         state = cls.get_state(db, session_id, user_id, role) if session_id else {}
 
-        # Active multi-turn transport continuations
+        # Active multi-turn continuations
         flow = state.get("flow")
         if flow in ("transport_select_appt", "transport_need_address"):
             return cls._continue_transport_flow(db, pid, user_id, role, session_id, message, text, state, language)
+        if flow in (
+            "cancel_select_appt", "cancel_awaiting_reason", "cancel_offer_transport",
+            "cancel_work_prefs", "cancel_pick_slot", "cancel_confirm",
+            "cancel_confirm_or_keep", "cancel_confirm_or_reschedule",
+        ):
+            return cls._continue_cancel_flow(db, pid, user_id, role, session_id, message, text, state, language)
         if flow == "transport_update_details" and (
             _detect_companion(text) is not None or re.search(r"\b(yes|no|address|street|road|from)\b", text)
-        ) and not _any(REPORT_PATTERNS, text) and not _any(TRANSPORT_PATTERNS, text):
+        ) and not _any(REPORT_PATTERNS, text) and not _any(TRANSPORT_PATTERNS, text) and not _any(CANCEL_PATTERNS, text):
             return cls._update_transport_details(db, pid, user_id, role, session_id, message, text, state, language)
 
         # B1 - report summary
         if _any(REPORT_PATTERNS, text):
             return cls._handle_report_summary(db, pid, language)
+
+        # B3 - cancellation with WHY question (check before transport so "cancel because no ride" starts cancel flow)
+        if _any(CANCEL_PATTERNS, text):
+            return cls._handle_cancel_start(db, pid, user_id, role, session_id, language)
 
         # B2 - transport request
         if _any(TRANSPORT_PATTERNS, text):
@@ -424,6 +480,404 @@ class PatientBehaviourRouter:
             if companion_hint is None:
                 reply += f" Will a caregiver travel with you from {address}?"
         return BehaviourResult(reply=reply, intent="transport_request", tool_observations=obs, case_id=str(appt.case_id))
+
+    # ------------------------------------------------------------------
+    # B3 - Cancellation with a WHY question
+    # ------------------------------------------------------------------
+    @classmethod
+    def _handle_cancel_start(
+        cls, db: Session, patient_id: uuid.UUID, user_id, role: str, session_id, language: str, selected_appt=None
+    ) -> BehaviourResult:
+        from app.services.transport_service import TransportService
+
+        appts = [selected_appt] if selected_appt else TransportService.find_candidate_appointments(db, patient_id)
+        if not appts:
+            if session_id:
+                cls.set_state(db, session_id, user_id, role, {})
+            return BehaviourResult(
+                reply="I do not see an active upcoming appointment on your schedule to cancel.",
+                intent="appointment_cancellation",
+            )
+
+        if len(appts) > 1:
+            lines = [
+                f"{i + 1}. {_utc(a.scheduled_time).strftime('%Y-%m-%d %H:%M')} with {a.provider_name}"
+                for i, a in enumerate(appts[:3])
+            ]
+            if session_id:
+                cls.set_state(db, session_id, user_id, role, {
+                    "flow": "cancel_select_appt",
+                    "appointment_ids": [str(a.id) for a in appts[:3]],
+                })
+            reply = (
+                "You have more than one upcoming appointment:\n"
+                + "\n".join(lines)
+                + "\n\nWhich appointment are you asking about?"
+            )
+            return BehaviourResult(reply=reply, intent="appointment_cancellation", case_id=str(appts[0].case_id))
+
+        appt = appts[0]
+        if session_id:
+            cls.set_state(db, session_id, user_id, role, {
+                "flow": "cancel_awaiting_reason",
+                "appointment_id": str(appt.id),
+            })
+        when = _utc(appt.scheduled_time).strftime("%Y-%m-%d at %H:%M")
+        if language == "es":
+            reply = f"Veo su cita el {when} con {appt.provider_name}. ¿Puede contarme qué le dificulta asistir?"
+        elif language == "ar":
+            reply = f"أرى موعدكِ في {when} مع {appt.provider_name}. هل يمكنكِ إخباري بما يجعل الحضور صعباً؟"
+        else:
+            reply = (
+                f"I see your appointment on {when} with {appt.provider_name}. "
+                "Can you tell me what is making it hard to come?"
+            )
+        return BehaviourResult(reply=reply, intent="appointment_cancellation", case_id=str(appt.case_id))
+
+    @classmethod
+    def _continue_cancel_flow(
+        cls, db: Session, patient_id: uuid.UUID, user_id, role: str, session_id,
+        raw_message: str, text: str, state: Dict[str, Any], language: str,
+    ) -> BehaviourResult:
+        from app.models.appointment import Appointment
+        from app.services.appointment_service import AppointmentService
+        from app.services.task_service import TaskService
+        from app.services.transport_service import TransportService
+
+        flow = state.get("flow")
+
+        if flow == "cancel_select_appt":
+            ids = state.get("appointment_ids") or []
+            chosen_id = None
+            m = re.search(r"\b([1-3])\b", text)
+            if m and int(m.group(1)) <= len(ids):
+                chosen_id = ids[int(m.group(1)) - 1]
+            if not chosen_id:
+                return BehaviourResult(
+                    reply="Please reply with the number (1, 2, or 3) of the appointment you want to change or cancel?",
+                    intent="appointment_cancellation",
+                )
+            appt = db.query(Appointment).filter(
+                Appointment.id == uuid.UUID(chosen_id), Appointment.patient_id == patient_id
+            ).first()
+            if not appt:
+                cls.set_state(db, session_id, user_id, role, {})
+                return BehaviourResult(reply="I could not find that appointment.", intent="appointment_cancellation")
+            return cls._handle_cancel_start(db, patient_id, user_id, role, session_id, language, selected_appt=appt)
+
+        appt_id = state.get("appointment_id")
+        appt = db.query(Appointment).filter(
+            Appointment.id == uuid.UUID(appt_id), Appointment.patient_id == patient_id
+        ).first() if appt_id else None
+        if not appt:
+            cls.set_state(db, session_id, user_id, role, {})
+            return BehaviourResult(reply="I could not find that appointment anymore.", intent="appointment_cancellation")
+
+        case = db.query(CareCase).filter(CareCase.id == appt.case_id).first()
+        coord = TransportService.get_coordinator_name(db, case)
+
+        # Explicit cancellation confirmation from any post-WHY state
+        if _any(EXPLICIT_CANCEL_CONFIRM_PATTERNS, text) and flow != "cancel_awaiting_reason":
+            reason_cat = state.get("reason_category") or "other"
+            reason_txt = state.get("reason_text") or "Patient confirmed cancellation"
+            res = AppointmentService.cancel_appointment(
+                db=db,
+                appointment_id=appt.id,
+                reason=reason_txt,
+                reason_category=reason_cat,
+                patient_id=patient_id,
+                actor_role="patient",
+                actor_id=str(user_id),
+            )
+            cls.set_state(db, session_id, user_id, role, {})
+            obs = [{"tool": "cancel_appointment", "success": bool(res.get("success")), "result": res}]
+            if not res.get("success"):
+                return BehaviourResult(
+                    reply="I could not cancel the appointment right now. I have asked your coordinator to help.",
+                    intent="appointment_cancellation", tool_observations=obs, case_id=str(appt.case_id),
+                )
+            reply = (
+                f"Your appointment with {appt.provider_name} has been cancelled. "
+                f"I have let {appt.provider_name} and {coord} know, and {coord} will check in with you "
+                "to help when you are ready for a new time."
+            )
+            return BehaviourResult(
+                reply=reply, intent="appointment_cancellation", tool_observations=obs, case_id=str(appt.case_id)
+            )
+
+        # Step 2: Classify reason after WHY question
+        if flow == "cancel_awaiting_reason":
+            reason_cat = _classify_cancel_reason(text)
+            reason_txt = raw_message.strip()
+            new_state = {
+                "appointment_id": str(appt.id),
+                "reason_category": reason_cat,
+                "reason_text": reason_txt,
+            }
+            # Persist structured reason on case_context inquiry log
+            if case:
+                ctx = dict(case.case_context or {})
+                inquiries = list(ctx.get("cancellation_inquiries") or [])
+                inquiries.append({
+                    "appointment_id": str(appt.id),
+                    "reason_category": reason_cat,
+                    "reason_text": reason_txt,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                })
+                ctx["cancellation_inquiries"] = inquiries
+                case.case_context = ctx
+                db.flush()
+
+            if reason_cat == "transport":
+                new_state["flow"] = "cancel_offer_transport"
+                cls.set_state(db, session_id, user_id, role, new_state)
+                reply = (
+                    "Thank you for sharing that. Getting to the clinic can be hard, and I can request a ride "
+                    "for you before we cancel anything. If you still want to cancel, that is completely okay too. "
+                    "Would you like me to request transport for this visit, or reply 'yes, cancel' to cancel it?"
+                )
+                return BehaviourResult(reply=reply, intent="appointment_cancellation", case_id=str(appt.case_id))
+
+            if reason_cat in ("work_or_schedule", "caregiver_or_family"):
+                constraints = _parse_slot_constraints(text)
+                if constraints:
+                    return cls._offer_real_slots_for_reschedule(
+                        db, appt, coord, constraints, new_state, user_id, role, session_id
+                    )
+                new_state["flow"] = "cancel_work_prefs"
+                cls.set_state(db, session_id, user_id, role, new_state)
+                q = (
+                    "What days and time of day usually work best for you?"
+                    if reason_cat == "work_or_schedule"
+                    else "What day works best for you and your family?"
+                )
+                reply = f"I understand how hard it is to fit visits around everything else. {q}"
+                return BehaviourResult(reply=reply, intent="appointment_cancellation", case_id=str(appt.case_id))
+
+            if reason_cat == "fear_or_anxiety":
+                new_state["flow"] = "cancel_confirm_or_keep"
+                cls.set_state(db, session_id, user_id, role, new_state)
+                reply = (
+                    "It makes complete sense to feel scared or overwhelmed before a medical visit. "
+                    f"This appointment with {appt.provider_name} is a calm conversation to talk through your report "
+                    "and answer your questions—nothing is forced on you, and it is always your choice. "
+                    "Would you like to keep this visit, look for another time, or reply 'yes, cancel' if you prefer to cancel?"
+                )
+                return BehaviourResult(reply=reply, intent="appointment_cancellation", case_id=str(appt.case_id))
+
+            if reason_cat == "illness":
+                from app.agents.specialized.clinical_escalation_agent import ClinicalEscalationAgent
+                obs = []
+                escalated = False
+                if ClinicalEscalationAgent.evaluate_safety_rules(raw_message):
+                    esc_task = TaskService.create_clinical_escalation_task(
+                        db=db,
+                        case_id=appt.case_id,
+                        patient_id=patient_id,
+                        red_flag_symptoms=["patient_reported_red_flag_during_cancellation"],
+                        patient_statement=raw_message,
+                        idempotency_key=f"esc_cancel_{appt.id}_{uuid.uuid4().hex[:6]}",
+                    )
+                    db.commit()
+                    obs.append({"tool": "create_clinical_escalation_task", "success": True, "result": {"task_id": str(esc_task.id)}})
+                    escalated = True
+                    new_state["flow"] = "cancel_confirm_or_reschedule"
+                    cls.set_state(db, session_id, user_id, role, new_state)
+                    reply = (
+                        "I am really sorry you are feeling unwell, and the symptoms you described need prompt medical attention. "
+                        "I have alerted your clinical team right away. Please contact your doctor or local emergency services now if you feel unsafe. "
+                        "Whenever you are ready, reply if you want to reschedule or 'yes, cancel' to cancel your upcoming visit?"
+                    )
+                    return BehaviourResult(
+                        reply=reply, intent="urgent_clinical_escalation", tool_observations=obs,
+                        escalated=escalated, case_id=str(appt.case_id),
+                    )
+                new_state["flow"] = "cancel_confirm_or_reschedule"
+                cls.set_state(db, session_id, user_id, role, new_state)
+                reply = (
+                    "I am sorry you are not feeling well. Please contact your doctor if your symptoms are worrying or getting worse. "
+                    "Would you like to reschedule this visit for a later day, or reply 'yes, cancel' to cancel it?"
+                )
+                return BehaviourResult(reply=reply, intent="appointment_cancellation", case_id=str(appt.case_id))
+
+            if reason_cat == "cost":
+                fin_task = TaskService.create_task(
+                    db=db,
+                    case_id=appt.case_id,
+                    patient_id=patient_id,
+                    title="Financial Counselling Request (Appointment Cost Barrier)",
+                    description=f"Patient cited cost barrier when considering cancelling appointment {appt.id}: '{reason_txt}'.",
+                    task_type="financial_counselling",
+                    assigned_role="care_coordinator",
+                    priority="urgent",
+                    idempotency_key=f"fin_counsel_{appt.id}_v{appt.version}",
+                )
+                db.commit()
+                new_state["flow"] = "cancel_confirm"
+                cls.set_state(db, session_id, user_id, role, new_state)
+                obs = [{"tool": "create_financial_counselling_task", "success": True, "result": {"task_id": str(fin_task.id)}}]
+                reply = (
+                    "Thank you for telling me—worrying about cost is very understandable. "
+                    f"I have requested financial counselling from {coord} (it is requested, not resolved yet), "
+                    "and they will reach out to discuss options. "
+                    "Would you like to wait to hear from them, or reply 'yes, cancel' if you still want to cancel?"
+                )
+                return BehaviourResult(
+                    reply=reply, intent="appointment_cancellation", tool_observations=obs, case_id=str(appt.case_id)
+                )
+
+            # other
+            new_state["flow"] = "cancel_confirm"
+            cls.set_state(db, session_id, user_id, role, new_state)
+            reply = (
+                f"Thank you for letting me know. Your appointment on {_utc(appt.scheduled_time).strftime('%Y-%m-%d at %H:%M')} "
+                "is still active until you confirm. Would you like me to cancel it? Please reply 'yes, cancel' to confirm."
+            )
+            return BehaviourResult(reply=reply, intent="appointment_cancellation", case_id=str(appt.case_id))
+
+        # Offering transport before cancelling
+        if flow == "cancel_offer_transport":
+            if re.search(r"\b(yes|ride|transport|pickup|please|help)\b", text) and "cancel" not in text:
+                cls.set_state(db, session_id, user_id, role, {})
+                return cls._handle_transport_request(
+                    db, patient_id, user_id, role, session_id, raw_message, text, language, selected_appt=appt
+                )
+            state["flow"] = "cancel_confirm"
+            cls.set_state(db, session_id, user_id, role, state)
+            return BehaviourResult(
+                reply="That is completely fine. Please reply 'yes, cancel' to confirm cancelling your appointment.",
+                intent="appointment_cancellation", case_id=str(appt.case_id),
+            )
+
+        # Gathering preferred day/time for work/schedule or caregiver/family
+        if flow == "cancel_work_prefs":
+            if "cancel" in text:
+                state["flow"] = "cancel_confirm"
+                cls.set_state(db, session_id, user_id, role, state)
+                return BehaviourResult(
+                    reply="No problem. Please reply 'yes, cancel' to confirm cancelling your appointment.",
+                    intent="appointment_cancellation", case_id=str(appt.case_id),
+                )
+            constraints = _parse_slot_constraints(text)
+            return cls._offer_real_slots_for_reschedule(
+                db, appt, coord, constraints, state, user_id, role, session_id
+            )
+
+        # Picking one of the real offered slots to reschedule instead of cancelling
+        if flow == "cancel_pick_slot":
+            slots = state.get("offered_slots") or []
+            chosen = None
+            m = re.search(r"\b([1-3])\b", text)
+            if m and int(m.group(1)) <= len(slots):
+                chosen = slots[int(m.group(1)) - 1]
+            else:
+                for sl in slots:
+                    if sl.get("hhmm") and sl["hhmm"] in text:
+                        chosen = sl
+                        break
+            if chosen:
+                new_dt = datetime.fromisoformat(chosen["iso"].replace("Z", "+00:00"))
+                moved = AppointmentService.reschedule_appointment(
+                    db=db,
+                    appointment_id=appt.id,
+                    new_scheduled_time=new_dt,
+                    actor_role="patient",
+                    actor_id=str(user_id),
+                    reason=state.get("reason_text") or "Patient schedule preference",
+                )
+                db.commit()
+                cls.set_state(db, session_id, user_id, role, {})
+                obs = [{"tool": "reschedule_appointment", "success": True, "result": {
+                    "appointment_id": str(moved.id), "version": moved.version, "scheduled_time": chosen["iso"]
+                }}]
+                reply = (
+                    f"I have moved your appointment to {chosen['display']} (version {moved.version}) "
+                    f"and notified {moved.provider_name} to confirm the new time."
+                )
+                return BehaviourResult(
+                    reply=reply, intent="appointment_rescheduled", tool_observations=obs, case_id=str(appt.case_id)
+                )
+            state["flow"] = "cancel_confirm"
+            cls.set_state(db, session_id, user_id, role, state)
+            return BehaviourResult(
+                reply="Understood. If none of those times work, please reply 'yes, cancel' to confirm cancelling your appointment.",
+                intent="appointment_cancellation", case_id=str(appt.case_id),
+            )
+
+        # cancel_confirm / cancel_confirm_or_keep / cancel_confirm_or_reschedule
+        if re.search(r"\bkeep\b|\bdon'?t\s+cancel\b|\bnever\s*mind\b|\bstay\b", text):
+            cls.set_state(db, session_id, user_id, role, {})
+            return BehaviourResult(
+                reply=f"Your appointment on {_utc(appt.scheduled_time).strftime('%Y-%m-%d at %H:%M')} stays on your schedule. How else can I help?",
+                intent="appointment_kept", case_id=str(appt.case_id),
+            )
+        if re.search(r"\b(move|reschedule|another\s+time|different\s+day|later)\b", text):
+            state["flow"] = "cancel_work_prefs"
+            cls.set_state(db, session_id, user_id, role, state)
+            return BehaviourResult(
+                reply="What days and time of day work best for you?",
+                intent="appointment_cancellation", case_id=str(appt.case_id),
+            )
+
+        state["flow"] = "cancel_confirm"
+        cls.set_state(db, session_id, user_id, role, state)
+        return BehaviourResult(
+            reply="Your appointment is not cancelled yet. Please reply 'yes, cancel' if you want me to cancel it.",
+            intent="appointment_cancellation", case_id=str(appt.case_id),
+        )
+
+    @classmethod
+    def _offer_real_slots_for_reschedule(
+        cls, db: Session, appt, coord: str, constraints: Dict[str, Any],
+        state: Dict[str, Any], user_id, role: str, session_id,
+    ) -> BehaviourResult:
+        from app.services.appointment_service import AppointmentService
+        from app.services.task_service import TaskService
+
+        slots = AppointmentService.get_available_slots(db, doctor=appt.provider_name, constraints=constraints, limit=3)
+        obs = [{"tool": "get_available_slots", "success": True, "result": {"count": len(slots), "constraints": constraints}}]
+
+        if slots:
+            state["flow"] = "cancel_pick_slot"
+            state["offered_slots"] = slots
+            cls.set_state(db, session_id, user_id, role, state)
+            lines = [f"{i + 1}. {s['display']}" for i, s in enumerate(slots)]
+            reply = (
+                f"Here are real open times with {appt.provider_name}:\n"
+                + "\n".join(lines)
+                + "\n\nWould you like to move your appointment to one of these (reply 1, 2, or 3), or reply 'yes, cancel' to cancel?"
+            )
+            return BehaviourResult(
+                reply=reply, intent="appointment_cancellation", tool_observations=obs, case_id=str(appt.case_id)
+            )
+
+        # No real slots match -> NEVER invent a slot; create coordinator task and say so honestly
+        task = TaskService.create_task(
+            db=db,
+            case_id=appt.case_id,
+            patient_id=appt.patient_id,
+            title=f"Find Matching Appointment Slot ({appt.provider_name})",
+            description=(
+                f"Patient requested reschedule matching constraints {constraints} for appointment {appt.id}, "
+                "but no real schedule slots matched. Please assist patient directly."
+            ),
+            task_type="reschedule_assistance",
+            assigned_role="care_coordinator",
+            priority="urgent",
+            idempotency_key=f"resched_assist_{appt.id}_{uuid.uuid4().hex[:6]}",
+        )
+        db.commit()
+        obs.append({"tool": "create_coordinator_task", "success": True, "result": {"task_id": str(task.id)}})
+        state["flow"] = "cancel_confirm"
+        cls.set_state(db, session_id, user_id, role, state)
+        reply = (
+            f"I checked {appt.provider_name}'s schedule and there are no open slots matching that time right now. "
+            f"I have asked {coord} to look for an option and follow up with you. "
+            "Would you like to wait for them, or reply 'yes, cancel' if you want to cancel your current visit?"
+        )
+        return BehaviourResult(
+            reply=reply, intent="appointment_cancellation", tool_observations=obs, case_id=str(appt.case_id)
+        )
 
     # ------------------------------------------------------------------
     # Persist reply + post-delivery actions
