@@ -316,6 +316,13 @@ class AppointmentService:
             appt.patient_confirmed_version = appt.version
             appt.status = "PENDING_DOCTOR_CONFIRMATION"
 
+        # Automatically resync any active transport request for this appointment
+        try:
+            from app.services.transport_service import TransportService
+            TransportService.sync_on_reschedule(db, appt)
+        except Exception as sync_err:
+            logger.warning(f"Transport resync notice on reschedule: {sync_err}")
+
         return appt
 
     @classmethod

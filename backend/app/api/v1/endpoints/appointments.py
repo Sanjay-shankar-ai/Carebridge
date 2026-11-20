@@ -660,3 +660,27 @@ async def confirm_appointment(
         message="Appointment marked CONFIRMED after mutual dual confirmation." if is_fully_confirmed else f"Confirmation recorded for {caller_role}. Pending dual confirmation."
     )
 
+
+@router.post("/transport-requests/{transport_request_id}/confirm", response_model=ApiResponseEnvelope[Dict[str, Any]], summary="Coordinator Confirms Patient Transport Request")
+async def confirm_transport_request(
+    transport_request_id: uuid.UUID,
+    current_user: UserPrincipal = Depends(get_current_user),
+):
+    """Only an authorized care coordinator may move a transport request to CONFIRMED."""
+    from app.database.session import get_sync_db
+    from app.services.transport_service import TransportService, TransportAuthorizationError
+    try:
+        with get_sync_db() as sync_db:
+            res = TransportService.confirm_transport_request(
+                db=sync_db,
+                transport_request_id=transport_request_id,
+                actor_role=current_user.role,
+                actor_id=str(current_user.user_id),
+            )
+    except TransportAuthorizationError as auth_err:
+        raise HTTPException(status_code=403, detail=str(auth_err))
+    if not res.get("success"):
+        raise HTTPException(status_code=404, detail=res.get("error", "Transport request not found"))
+    return ApiResponseEnvelope.success_response(data=res, message="Transport request confirmed and patient notified.")
+
+

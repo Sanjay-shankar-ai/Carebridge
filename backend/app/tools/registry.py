@@ -1509,3 +1509,27 @@ class ToolRegistry:
         from app.tools.schemas import RetrieveClosureEvidenceInput
         import app.tools.closure_tools as clos_tools
         return clos_tools.retrieve_closure_evidence(db, RetrieveClosureEvidenceInput(case_id=case_id, actor_role=actor_role)).model_dump()
+
+    @classmethod
+    def create_transport_request(
+        cls,
+        db: Session,
+        appointment_id: str,
+        pickup_time: Optional[datetime] = None,
+        address: str = "",
+        companion: bool = False,
+        patient_id: Optional[str] = None,
+        actor_role: str = "patient",
+        actor_id: str = "ai_coordinator",
+    ) -> Dict[str, Any]:
+        from app.services.transport_service import TransportService
+        return TransportService.create_transport_request(
+            db=db,
+            appointment_id=appointment_id,
+            pickup_time=pickup_time,
+            address=address,
+            companion=companion,
+            patient_id=patient_id,
+            actor_role=actor_role,
+            actor_id=actor_id,
+        )

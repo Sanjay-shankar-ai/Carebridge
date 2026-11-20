@@ -42,7 +42,16 @@ ACTION_CLAIM_PATTERNS = {
     ],
     "NOTIFICATION_DISPATCHED": [
         r"\b(?:notification has been sent|alert has been dispatched|notified the clinic|notified your care team|sent an alert to|alerted your doctor)\b",
-    ]
+    ],
+    "TRANSPORT_CONFIRMED": [
+        r"\b(?:your\s+)?(?:ride|transport|pickup|pick-up|driver)\s+(?:is|has been)\s+(?:now\s+)?(?:confirmed|arranged|booked|secured)\b",
+        r"\b(?:i have|we have|i've|we've)\s+(?:confirmed|arranged|booked)\s+(?:your\s+)?(?:ride|transport|pickup|pick-up)\b",
+    ],
+    "APPOINTMENT_CANCELLED": [
+        r"\b(?:your\s+)?(?:appointment|visit|consultation)\s+(?:is|has been)\s+(?:now\s+)?(?:cancel+ed)\b",
+        r"\b(?:i have|we have|i've|we've)\s+(?:successfully\s+)?(?:cancel+ed)\s+(?:your\s+)?(?:appointment|visit|consultation)\b",
+        r"\bappointment\s+cancel+ed\b",
+    ],
 }
 
 TOOL_ACTION_MAPPING = {
@@ -60,7 +69,13 @@ TOOL_ACTION_MAPPING = {
     ],
     "NOTIFICATION_DISPATCHED": [
         "notify_case_owner", "send_notification", "notify_screening_missed", "notify_doctor_review_completed", "notify_patient_message"
-    ]
+    ],
+    "TRANSPORT_CONFIRMED": [
+        "confirm_transport_request"
+    ],
+    "APPOINTMENT_CANCELLED": [
+        "cancel_appointment"
+    ],
 }
 
 
@@ -145,6 +160,16 @@ class ResponseGuardService:
             return (
                 "The screening order has not yet been finalized. "
                 "Our team is validating the clinical requirements and will notify you as soon as it is scheduled."
+            )
+        elif category == "TRANSPORT_CONFIRMED":
+            return (
+                "Your ride is not confirmed yet. "
+                "I can submit a transport request to your care coordinator, who will confirm the pickup and let you know."
+            )
+        elif category == "APPOINTMENT_CANCELLED":
+            return (
+                "Your appointment has not been cancelled yet. "
+                "Before cancelling, could you tell me what is making it hard to come, or confirm if you want me to cancel it?"
             )
 
         return draft
