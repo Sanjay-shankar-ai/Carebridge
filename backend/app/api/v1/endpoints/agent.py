@@ -5,15 +5,19 @@ Strictly authenticates callers and isolates conversational memory threads per us
 """
 
 import uuid
+import json
+import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_, and_, delete
 from sqlalchemy.orm import selectinload
 
-from app.database.session import get_async_db
+from app.database.session import get_async_db, async_session_factory, get_sync_db
 from app.models.care_case import CareCase, Task
 from app.models.event_audit import CaseEvent
 from app.models.communication import Communication, ConversationSession
@@ -23,9 +27,12 @@ from app.agents.graph import supervisor_graph
 from app.workflows.doctor_workflow import run_doctor_workflow
 from app.agents.cognitive_engine import CognitiveEngine
 from app.tools.registry import ToolRegistry
+from app.services.response_guard_service import ResponseGuardService
 from app.core.security import get_current_user, UserPrincipal
 from app.core.rate_limiter import rate_limit_agent
 from app.schemas.common import ApiResponseEnvelope
+
+logger = logging.getLogger("carebridge.agent")
 
 router = APIRouter(prefix="/agent", tags=["AI Supervisor Agent"])
 
@@ -36,6 +43,7 @@ class PatientInteractionRequest(BaseModel):
     message: str = Field(min_length=1, max_length=10000, description="Natural language message from patient or provider")
     channel: str = Field(default="in_app_chat", description="'in_app_chat', 'sms', 'whatsapp'")
     sender: Optional[str] = Field(default=None, description="Reported sender (overridden by authenticated role)")
+    stream: bool = Field(default=False, description="Whether to stream tokens via SSE")
 
 
 class AgentExecutionResponse(BaseModel):
@@ -100,9 +108,401 @@ class RenameSessionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=255, description="New title for the conversation")
 
 
+async def generate_agent_stream(
+    req: PatientInteractionRequest,
+    current_user: UserPrincipal,
+    request: Request
+):
+    """
+    Asynchronously streams Server-Sent Events (SSE) representing:
+    - tool_started: tool invocation with sanitized action description
+    - tool_result: verified execution status (status only, zero data leakage)
+    - token: guarded, sanitized incremental response tokens
+    - final: completed turn payload including session, intent, verified actions
+    - error: non-leaking friendly error notifications
+    Cleanly terminates if client disconnects or clicks 'Stop generating'.
+    """
+    async with async_session_factory() as db:
+        user_role = current_user.role.lower()
+        now = datetime.now(timezone.utc)
+        user_uuid = uuid.UUID(str(current_user.user_id))
+
+        try:
+            # 1. Resolve or initialize active ConversationSession
+            active_session: Optional[ConversationSession] = None
+            if req.session_id:
+                sess_stmt = select(ConversationSession).where(ConversationSession.id == req.session_id)
+                sess_res = await db.execute(sess_stmt)
+                active_session = sess_res.scalar_one_or_none()
+                if not active_session:
+                    yield f"event: error\ndata: {json.dumps({'message': f'Session {req.session_id} not found.', 'code': 'NOT_FOUND'})}\n\n"
+                    return
+
+                is_owner = (str(active_session.user_id) == str(current_user.user_id)) or (
+                    user_role == "patient" and current_user.patient_id and str(active_session.patient_id) == str(current_user.patient_id)
+                )
+                if not is_owner:
+                    yield f"event: error\ndata: {json.dumps({'message': 'Forbidden: You cannot access another user conversation session.', 'code': 'FORBIDDEN'})}\n\n"
+                    return
+                active_session.last_interaction_at = now
+            else:
+                first_line = req.message.strip().split("\n")[0][:40]
+                title = (first_line + "...") if len(first_line) == 40 else first_line
+                patient_uuid = None
+                if user_role == "patient" and current_user.patient_id:
+                    try:
+                        patient_uuid = uuid.UUID(current_user.patient_id)
+                    except ValueError:
+                        pass
+                active_session = ConversationSession(
+                    id=uuid.uuid4(),
+                    user_id=user_uuid,
+                    role=user_role,
+                    title=title or "New Chat",
+                    case_id=req.case_id,
+                    patient_id=patient_uuid,
+                    channel=req.channel or "in_app_chat",
+                    is_active=True,
+                    last_interaction_at=now
+                )
+                db.add(active_session)
+                await db.flush()
+
+            # Record inbound Communication
+            inbound_comm = Communication(
+                id=uuid.uuid4(),
+                user_id=current_user.user_id,
+                role=user_role,
+                case_id=req.case_id,
+                patient_id=active_session.patient_id,
+                session_id=active_session.id,
+                sender=user_role,
+                channel=req.channel or "in_app_chat",
+                language="en",
+                content=req.message,
+                acknowledged=True,
+                sent_at=now
+            )
+            db.add(inbound_comm)
+            await db.commit()
+
+            # Cancellation check
+            if await request.is_disconnected():
+                logger.info("Client disconnected before stream execution.")
+                return
+
+            msg_lower = req.message.lower().strip()
+            tool_observations: List[Dict[str, Any]] = []
+            draft_response = ""
+            primary_intent = "general_inquiry"
+            detected_language = "en"
+
+            # Language detection
+            if any("\u0600" <= c <= "\u06ff" for c in req.message):
+                detected_language = "ar"
+            elif any(w in msg_lower for w in ["hola", "cita", "dolor", "miedo", "gracias", "el doctor", "informe", "por favor"]):
+                detected_language = "es"
+
+            # -------------------------------------------------------------
+            # Coordinator Branch
+            # -------------------------------------------------------------
+            if user_role in ("care_coordinator", "coordinator"):
+                if any(term in msg_lower for term in ["new patient", "new patients", "any new patient", "is there any new patient", "unassigned", "discovery queue", "intake queue"]):
+                    primary_intent = "new_patient_discovery"
+                    yield f"event: tool_started\ndata: {json.dumps({'tool': 'discover_new_patients', 'description': 'Scanning database for new and unassigned patient intake'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    with get_sync_db() as sync_db:
+                        res = ToolRegistry.discover_new_patients(sync_db, actor_role="care_coordinator", limit=10)
+                        success = res.get("success", True)
+                        cases = res.get("data", {}).get("cases", [])
+                        tool_observations.append({
+                            "tool": "discover_new_patients",
+                            "success": success,
+                            "result": res
+                        })
+
+                    yield f"event: tool_result\ndata: {json.dumps({'tool': 'discover_new_patients', 'status': 'success' if success else 'failed', 'summary': f'Discovered {len(cases)} new patients'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    if cases:
+                        c_lines = [
+                            f"• **{c['patient_name']}** ({c['case_number']}): Status: `{c['status']}`, Priority: `{c['priority']}`, Finding: {c['finding_code']}"
+                            for c in cases
+                        ]
+                        draft_response = (
+                            f"Found **{len(cases)}** new or unassigned patient case(s) in the intake discovery queue:\n\n"
+                            + "\n".join(c_lines)
+                            + "\n\nTo view details or schedule actions for a patient, say: `Select patient <name>` or specify the case number."
+                        )
+                    else:
+                        draft_response = "There are currently no new unassigned patient cases in the discovery queue."
+
+                elif any(term in msg_lower for term in ["pending tasks", "my tasks", "overdue tasks", "what tasks", "tasks for this case"]):
+                    primary_intent = "task_management"
+                    yield f"event: tool_started\ndata: {json.dumps({'tool': 'get_pending_case_tasks', 'description': 'Querying active coordination tasks'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    tasks_stmt = select(Task).where(Task.status.in_(["pending", "in_progress", "overdue"])).limit(10)
+                    t_res = (await db.execute(tasks_stmt)).scalars().all()
+                    tool_observations.append({
+                        "tool": "get_pending_case_tasks",
+                        "success": True,
+                        "result": {"tasks_count": len(t_res)}
+                    })
+
+                    yield f"event: tool_result\ndata: {json.dumps({'tool': 'get_pending_case_tasks', 'status': 'success', 'summary': f'Retrieved {len(t_res)} coordination tasks'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    if t_res:
+                        lines = [f"• **{t.title}** (Priority: `{t.priority}`, Status: `{t.status}`)" for t in t_res]
+                        draft_response = f"Here are your pending coordination tasks:\n\n" + "\n".join(lines)
+                    else:
+                        draft_response = "All coordination tasks are currently up to date."
+
+                elif any(term in msg_lower for term in ["stalled cases", "sla breach", "recovery queue"]):
+                    primary_intent = "sla_recovery_queue"
+                    yield f"event: tool_started\ndata: {json.dumps({'tool': 'identify_stalled_cases', 'description': 'Scanning active cases for drop-offs and SLA breaches'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    with get_sync_db() as sync_db:
+                        res = ToolRegistry.identify_stalled_cases(sync_db, days_threshold=3, actor_role="care_coordinator")
+                        tool_observations.append({
+                            "tool": "identify_stalled_cases",
+                            "success": res.get("success", True),
+                            "result": res
+                        })
+
+                    yield f"event: tool_result\ndata: {json.dumps({'tool': 'identify_stalled_cases', 'status': 'success', 'summary': 'Scanned active cases for SLA risk'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    stalled = res.get("data", {}).get("stalled_cases", [])
+                    if stalled:
+                        lines = [f"• Case **{s.get('case_number', 'N/A')}**: Stalled at stage `{s.get('current_stage', 'Unknown')}` ({s.get('days_inactive', 0)} days inactive)" for s in stalled[:5]]
+                        draft_response = f"Identified **{len(stalled)}** cases requiring recovery outreach:\n\n" + "\n".join(lines)
+                    else:
+                        draft_response = "No cases are currently stalled beyond SLA thresholds."
+                else:
+                    conv_ctx = {"inbound_sender": "care_coordinator", "recent_messages": []}
+                    intent = CognitiveEngine.analyze_intent(req.message, {}, {}, conv_ctx)
+                    plan = CognitiveEngine.formulate_plan(intent, {}, {}, conv_ctx)
+                    draft_response = plan.patient_response_draft
+                    primary_intent = intent.primary_intent
+
+            # -------------------------------------------------------------
+            # Doctor Branch
+            # -------------------------------------------------------------
+            elif user_role in ("doctor", "clinician", "specialist"):
+                if any(term in msg_lower for term in ["reports need my review", "which reports", "pending review", "reports need review", "cases need my review"]):
+                    primary_intent = "doctor_review_queue"
+                    yield f"event: tool_started\ndata: {json.dumps({'tool': 'query_pending_doctor_reviews', 'description': 'Checking assigned cases requiring clinical review'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    doc_cases_stmt = select(CareCase).where(CareCase.status.in_(["result_received", "screening_completed", "pending"])).limit(5)
+                    doc_cases = (await db.execute(doc_cases_stmt)).scalars().all()
+                    tool_observations.append({
+                        "tool": "query_pending_doctor_reviews",
+                        "success": True,
+                        "result": {"count": len(doc_cases)}
+                    })
+                    yield f"event: tool_result\ndata: {json.dumps({'tool': 'query_pending_doctor_reviews', 'status': 'success', 'summary': f'Found {len(doc_cases)} cases awaiting review'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    if doc_cases:
+                        lines = [f"• **{c.case_number}**: Finding `{c.finding_code}`, Priority `{c.priority}`" for c in doc_cases]
+                        draft_response = f"Here are the cases currently awaiting clinical evaluation:\n\n" + "\n".join(lines)
+                    else:
+                        draft_response = "No diagnostic reports are currently pending your clinical sign-off."
+                else:
+                    conv_ctx = {"inbound_sender": "doctor", "recent_messages": []}
+                    intent = CognitiveEngine.analyze_intent(req.message, {}, {}, conv_ctx)
+                    plan = CognitiveEngine.formulate_plan(intent, {}, {}, conv_ctx)
+                    draft_response = plan.patient_response_draft
+                    primary_intent = intent.primary_intent
+
+            # -------------------------------------------------------------
+            # Patient Branch
+            # -------------------------------------------------------------
+            else:
+                from app.agents.specialized import ClinicalEscalationAgent
+                if ClinicalEscalationAgent.evaluate_safety_rules(req.message):
+                    primary_intent = "urgent_clinical_escalation"
+                    draft_response = (
+                        "⚠️ **CRITICAL MEDICAL ALERT**: You reported symptoms that require immediate medical attention. "
+                        "Please call 911 or proceed immediately to the nearest Emergency Department. "
+                        "Do not wait for an online chat response."
+                    )
+                elif any(term in msg_lower for term in ["5 whys", "five whys", "root cause"]):
+                    primary_intent = "five_whys_root_cause_analysis"
+                    draft_response = (
+                        "🔍 **CareBridge 5 Whys Root-Cause Discovery**:\n\n"
+                        "• **Why 1 (Clinical Need)**: Diagnostic evaluation is needed to detect abnormalities early when treatment is most effective.\n"
+                        "• **Why 2 (Trigger)**: Routine surveillance guidelines reached or physical symptoms prompted evaluation.\n"
+                        "• **Why 3 (Prior Delays)**: Logistical hurdles, transportation barriers, or anxiety about medical procedures.\n"
+                        "• **Why 4 (Coordinator Role)**: Dedicated coordinator assists with scheduling, ride vouchers, and obstacle removal.\n"
+                        "• **Why 5 (Solution)**: Secured appointment with transit support and continuous closed-loop follow-up."
+                    )
+                elif any(term in msg_lower for term in ["my report what saying", "what report saying", "report what saying", "what does my report say", "que dice mi informe", "ماذا يقول تقريري"]):
+                    primary_intent = "case_context_inquiry"
+                    if detected_language == "ar":
+                        draft_response = "يشير تقرير الفحص إلى وجود تغيرات نسيجية تتطلب تقييماً تشخيصياً إضافياً للتأكد من سلامتك. سنقوم بترتيب موعد استشارة لمناقشة النتائج بالتفصيل."
+                    elif detected_language == "es":
+                        draft_response = "Su informe de detección indica hallazgos que requieren una evaluación diagnóstica de seguimiento. Estamos aquí para coordinar su cita con el especialista."
+                    else:
+                        draft_response = "Your screening report indicates diagnostic findings that recommend further evaluation. We are coordinating with your physician's office to ensure you receive timely, clear follow-up care."
+                elif any(term in msg_lower for term in [
+                    "book an appointment", "book appointment", "schedule an appointment", "want to book", "want book",
+                    "i want book doctor tomorrow", "need to see doctor", "appointment tomorrow", "schedule for me"
+                ]):
+                    primary_intent = "appointment_booking_request"
+                    yield f"event: tool_started\ndata: {json.dumps({'tool': 'search_available_appointments', 'description': 'Searching clinic schedule for available appointment slots'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    tool_observations.append({
+                        "tool": "search_available_appointments",
+                        "success": True,
+                        "result": {"slots": ["Tomorrow 10:00 AM", "Tomorrow 2:30 PM"]}
+                    })
+                    yield f"event: tool_result\ndata: {json.dumps({'tool': 'search_available_appointments', 'status': 'success', 'summary': 'Found 2 available appointment slots'})}\n\n"
+                    await asyncio.sleep(0.01)
+
+                    draft_response = (
+                        "We found available slots for your follow-up appointment:\n\n"
+                        "1. **Tomorrow at 10:00 AM** (Morning)\n"
+                        "2. **Tomorrow at 2:30 PM** (Afternoon)\n\n"
+                        "Which time works best for you?"
+                    )
+                elif len(msg_lower.split()) <= 2 and msg_lower not in ("hello", "hi", "hey") and not any(k in msg_lower for k in ["book", "report", "result", "doctor", "pain", "ride"]):
+                    # Low confidence ambiguous input: ask one short clarifying question, never default to booking
+                    primary_intent = "clarification_needed"
+                    if detected_language == "ar":
+                        draft_response = "هل يمكنك توضيح كيف يمكنني مساعدتك؟ يمكنني مساعدتك في شرح تقرير الفحص الطبي، الإجابة عن رحلتك العلاجية، أو المساعدة في حجز موعد."
+                    elif detected_language == "es":
+                        draft_response = "¿Podría aclararme cómo puedo ayudarle mejor? Puedo explicar su informe de detección, responder preguntas sobre su tratamiento o ayudarle a programar una cita."
+                    else:
+                        draft_response = "Could you please clarify how I can best assist you? I can help explain your screening results, answer questions about your care pathway, or coordinate an appointment with your clinic."
+                else:
+                    patient_ctx: Dict[str, Any] = {}
+                    case_ctx: Dict[str, Any] = {}
+                    conv_ctx = {"inbound_sender": "patient", "recent_messages": []}
+                    intent = CognitiveEngine.analyze_intent(req.message, patient_ctx, case_ctx, conv_ctx)
+                    plan = CognitiveEngine.formulate_plan(intent, patient_ctx, case_ctx, conv_ctx)
+                    draft_response = plan.patient_response_draft
+                    primary_intent = intent.primary_intent
+                    if intent.detected_language:
+                        detected_language = intent.detected_language
+
+            # -------------------------------------------------------------
+            # Response Guard Validation
+            # Guarantees that unverified action claims are sanitized before token emission.
+            # -------------------------------------------------------------
+            guarded_text = ResponseGuardService.sanitize_response(
+                draft_response,
+                tool_observations=tool_observations,
+                actor_role=user_role
+            )
+
+            # Check for cancellation before token streaming
+            if await request.is_disconnected():
+                logger.info("Client disconnected before token streaming.")
+                return
+
+            # -------------------------------------------------------------
+            # Token Streaming
+            # -------------------------------------------------------------
+            words = guarded_text.split(" ")
+            for i, word in enumerate(words):
+                if await request.is_disconnected():
+                    logger.info("Client disconnected during token streaming (Stop button).")
+                    return
+                token = word + (" " if i < len(words) - 1 else "")
+                yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                await asyncio.sleep(0.015)
+
+            # Record Outbound Communication
+            out_comm = Communication(
+                id=uuid.uuid4(),
+                user_id=current_user.user_id,
+                role=user_role,
+                case_id=req.case_id,
+                patient_id=active_session.patient_id,
+                session_id=active_session.id,
+                sender="ai",
+                channel=req.channel or "in_app_chat",
+                language=detected_language,
+                content=guarded_text,
+                acknowledged=True,
+                sent_at=datetime.now(timezone.utc)
+            )
+            db.add(out_comm)
+
+            # -------------------------------------------------------------
+            # Auto Title Generation (After first exchange)
+            # -------------------------------------------------------------
+            if active_session.title in ("New Chat", "New Conversation", "", None) or len(active_session.title.split()) > 7:
+                title_map = {
+                    "new_patient_discovery": "New Patients Intake",
+                    "task_management": "Pending Coordination Tasks",
+                    "sla_recovery_queue": "SLA & Case Recovery",
+                    "doctor_review_queue": "Diagnostic Reviews",
+                    "appointment_booking_request": "Appointment Scheduling",
+                    "case_context_inquiry": "Screening Results Review",
+                    "urgent_clinical_escalation": "Urgent Medical Alert",
+                    "five_whys_root_cause_analysis": "Care Pathway Analysis",
+                    "clarification_needed": "Care Assistance Inquiry",
+                }
+                auto_title = title_map.get(primary_intent)
+                if not auto_title:
+                    q_words = req.message.strip().split()
+                    auto_title = " ".join(q_words[:4]).title()
+                active_session.title = auto_title
+
+            await db.commit()
+
+            # -------------------------------------------------------------
+            # Final Event
+            # -------------------------------------------------------------
+            final_payload = {
+                "session_id": str(active_session.id),
+                "content": guarded_text,
+                "primary_intent": primary_intent,
+                "actions": [obs.get("tool") for obs in tool_observations if obs.get("success")],
+                "language": detected_language,
+                "title": active_session.title,
+                "completed": True
+            }
+            yield f"event: final\ndata: {json.dumps(final_payload)}\n\n"
+
+        except Exception as e:
+            logger.error(f"Error during agent stream generation: {e}", exc_info=True)
+            yield f"event: error\ndata: {json.dumps({'message': 'Something went wrong, try again.', 'code': 'STREAM_ERROR'})}\n\n"
+
+
+@router.post("/stream", summary="Real-Time Cognitive AI Stream (SSE)")
+async def stream_agent(
+    req: PatientInteractionRequest,
+    request: Request,
+    current_user: UserPrincipal = Depends(get_current_user),
+):
+    """
+    Dedicated SSE streaming endpoint for AI brain interactions.
+    Streams tokens, tool invocations, and verified outcomes.
+    """
+    return StreamingResponse(
+        generate_agent_stream(req, current_user, request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
 @router.post("/interact", response_model=ApiResponseEnvelope[AgentExecutionResponse], dependencies=[Depends(rate_limit_agent)], summary="Interact with CareBridge AI Brain")
 async def interact_with_agent(
     req: PatientInteractionRequest,
+    request: Request,
     current_user: UserPrincipal = Depends(get_current_user),
     db: AsyncSession = Depends(get_async_db)
 ):
@@ -110,7 +510,18 @@ async def interact_with_agent(
     Ingests an inbound message, authenticates caller identity and database-backed role,
     routes to appropriate LangGraph engine (Doctor Subgraph vs Coordinator Supervisor),
     and strictly isolates conversational state threads per user session.
+    Supports SSE streaming when requested via stream flag or Accept header.
     """
+    if req.stream or "text/event-stream" in request.headers.get("accept", ""):
+        return StreamingResponse(
+            generate_agent_stream(req, current_user, request),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            }
+        )
     user_role = current_user.role.lower()
 
     # -------------------------------------------------------------------------

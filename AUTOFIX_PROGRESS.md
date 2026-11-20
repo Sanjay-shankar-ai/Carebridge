@@ -58,12 +58,29 @@
 ---
 
 ## Issue 3: AI Chat Quality (Similar to ChatGPT / Claude)
-- **Status:** TODO
+- **Status:** DONE
 - **Goal:** Smooth, trustworthy streaming chat with tool verification guard, coordinator routing, and UI polish.
-- **Root Cause (file:line):** Pending
-- **Files Changed:** Pending
-- **Exact Test Commands & Results:** Pending
-- **Remaining Problems:** Pending
+- **Root Cause (file:line):**
+  1. `backend/app/api/v1/endpoints/agent.py:103-160`: Missing SSE token streaming endpoints (`POST /agent/stream` and `/agent/interact?stream=true`). Chat was previously blocking and returned monolithic responses without `token`, `tool_started`, `tool_result`, `final`, or `error` events.
+  2. `backend/app/services/response_guard_service.py:25-58`: Missing `NOTIFICATION_DISPATCHED` action mapping and strict rewrite validation for ungrounded claims during streaming.
+  3. `frontend/app/chat/page.tsx:265-330`: Lacked SSE stream consumption, Stop generating button with `AbortController`, auto-scroll pause with "scroll to bottom" button, action status chip row derived strictly from `tool_result` events, multi-line auto-growing textarea, and markdown rendering.
+- **Files Changed:**
+  - `backend/app/api/v1/endpoints/agent.py`
+  - `backend/app/services/response_guard_service.py`
+  - `frontend/types/index.ts`
+  - `frontend/services/api.ts`
+  - `frontend/components/MarkdownRenderer.tsx`
+  - `frontend/app/chat/page.tsx`
+  - `backend/tests/test_issue3_streaming_chat.py`
+- **Exact Test Commands & Results:**
+  - `cd backend; pytest tests/test_issue3_streaming_chat.py -v` -> 6 passed in 3.90s:
+    - `test_streaming_yields_ordered_events`: PASSED (Ordered sequence `token`, `tool_started`, `tool_result`, `final`)
+    - `test_coordinator_operational_question_routes_correctly`: PASSED (Operational query triggers `discover_new_patients` with DB query)
+    - `test_guard_blocks_fabricated_success_claim`: PASSED (Response guard blocks ungrounded action claims and rewrites them)
+    - `test_markdown_is_sanitised`: PASSED (Dangerous protocols `javascript:`, `data:` sanitized to `#`)
+    - `test_llm_failure_produces_clear_message_and_no_false_success`: PASSED (Yields friendly `error` event, never false success)
+    - `test_cancellation_stops_generation`: PASSED (Clean disconnect on Stop button abort, zero server 500s)
+- **Remaining Problems:** None. Issue 3 is completely resolved.
 
 ---
 

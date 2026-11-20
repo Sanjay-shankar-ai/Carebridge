@@ -39,6 +39,9 @@ ACTION_CLAIM_PATTERNS = {
     ],
     "ORDER_PLACED": [
         r"\b(?:i have placed|order has been placed|ordered your screening|screening order submitted|successfully ordered)\b",
+    ],
+    "NOTIFICATION_DISPATCHED": [
+        r"\b(?:notification has been sent|alert has been dispatched|notified the clinic|notified your care team|sent an alert to|alerted your doctor)\b",
     ]
 }
 
@@ -54,6 +57,9 @@ TOOL_ACTION_MAPPING = {
     ],
     "ORDER_PLACED": [
         "order_screening", "create_screening_order"
+    ],
+    "NOTIFICATION_DISPATCHED": [
+        "notify_case_owner", "send_notification", "notify_screening_missed", "notify_doctor_review_completed", "notify_patient_message"
     ]
 }
 
