@@ -20,6 +20,7 @@ import {
   fetchUnreadCount,
   markNotificationRead,
   markAllNotificationsRead,
+  getApiBaseUrl,
 } from "../services/api";
 import { NotificationItem } from "../types";
 import { useAuth } from "../context/AuthContext";
@@ -64,9 +65,14 @@ export default function NotificationCenter() {
     let eventSource: EventSource | null = null;
     let reconnectTimeout: NodeJS.Timeout;
 
+    const apiBase = getApiBaseUrl();
+
     const connectSSE = () => {
+      if (!apiBase) {
+        return;
+      }
       try {
-        const url = `http://localhost:8000/api/v1/notifications/stream?token=${encodeURIComponent(user.token)}`;
+        const url = `${apiBase}/api/v1/notifications/stream?token=${encodeURIComponent(user.token)}`;
         eventSource = new EventSource(url);
 
         eventSource.addEventListener("notification", (e: MessageEvent) => {

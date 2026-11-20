@@ -634,10 +634,10 @@ export default function CoordinatorDashboard() {
                         <Badge variant="warning">{rc.priority}</Badge>
                       </div>
                       <p className="text-[11px] text-[#475569]">
-                        Barrier: <strong>{rc.barriers_detected.join(", ") || "Missed Visit / Transport"}</strong>
+                        Barrier: <strong>{(rc.barriers_detected || []).join(", ") || "Missed Visit / Transport"}</strong>
                       </p>
                       <div className="pt-1 flex items-center justify-between text-[11px]">
-                        <span className="text-[#0F766E] font-medium">{rc.active_playbook}</span>
+                        <span className="text-[#0F766E] font-medium">{(rc.active_playbook || "transportation_support").replace(/_/g, " ")}</span>
                         <button
                           type="button"
                           onClick={() => handleTriggerRecovery(rc.case_id)}
@@ -947,12 +947,12 @@ export default function CoordinatorDashboard() {
                     <div className="flex justify-between">
                       <span className="text-[#475569]">Detected Barrier:</span>
                       <span className="font-medium text-[#0F172A]">
-                        {rc.barriers_detected.join(", ") || "Missed Visit / Transport"}
+                        {(rc.barriers_detected || []).join(", ") || "Missed Visit / Transport"}
                       </span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-[#475569]">Active Playbook:</span>
-                      <span className="font-medium text-[#0F766E]">{rc.active_playbook}</span>
+                      <span className="font-medium text-[#0F766E]">{(rc.active_playbook || "transportation_support").replace(/_/g, " ")}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-[#475569]">Recovery Attempts:</span>

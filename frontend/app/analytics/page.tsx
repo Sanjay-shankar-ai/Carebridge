@@ -115,8 +115,14 @@ export default function AnalyticsDashboardPage() {
       ]);
 
       if (metricsRes) setMetricsData(metricsRes);
-      if (prioritiesRes) setPriorities(prioritiesRes);
-      if (optionsRes && optionsRes.providers?.length > 0) setFilterOptions(optionsRes);
+      if (Array.isArray(prioritiesRes)) {
+        setPriorities(prioritiesRes);
+      } else {
+        setPriorities([]);
+      }
+      if (optionsRes && Array.isArray(optionsRes.providers) && optionsRes.providers.length > 0) {
+        setFilterOptions(optionsRes);
+      }
     } catch (err) {
       console.error("Failed to load analytics dashboard data:", err);
     } finally {
@@ -136,14 +142,14 @@ export default function AnalyticsDashboardPage() {
     setSearchQuery("");
   };
 
-  const filteredPriorities = priorities.filter((p) => {
+  const filteredPriorities = (Array.isArray(priorities) ? priorities : []).filter((p) => {
     if (!searchQuery) return true;
     const q = searchQuery.toLowerCase();
     return (
-      p.patient_name.toLowerCase().includes(q) ||
-      p.case_number.toLowerCase().includes(q) ||
-      p.current_owner.toLowerCase().includes(q) ||
-      p.why_prioritized.toLowerCase().includes(q)
+      (p.patient_name || "").toLowerCase().includes(q) ||
+      (p.case_number || "").toLowerCase().includes(q) ||
+      (p.current_owner || "").toLowerCase().includes(q) ||
+      (p.why_prioritized || "").toLowerCase().includes(q)
     );
   });
 
@@ -258,11 +264,11 @@ export default function AnalyticsDashboardPage() {
             >
               <option value="all">All Providers & Coordinators</option>
               <option value="unassigned">Unassigned Cases Only</option>
-              {filterOptions.providers
+              {(Array.isArray(filterOptions?.providers) ? filterOptions.providers : [])
                 .filter((p) => p.id !== "all" && p.id !== "unassigned")
                 .map((p) => (
                   <option key={p.id} value={p.id}>
-                    {p.name} ({p.role.replace(/_/g, " ")})
+                    {p.name} ({(p.role || "").replace(/_/g, " ")})
                   </option>
                 ))}
             </select>

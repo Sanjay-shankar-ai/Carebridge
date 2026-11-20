@@ -83,17 +83,18 @@ export default function RecoveryQueuePage() {
     }
   };
 
-  const filteredCases = cases.filter((c) => {
+  const filteredCases = (Array.isArray(cases) ? cases : []).filter((c) => {
+    const q = searchQuery.toLowerCase();
     const matchesSearch =
-      c.patient_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      c.case_number.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      c.active_playbook.toLowerCase().includes(searchQuery.toLowerCase());
+      (c.patient_name || "").toLowerCase().includes(q) ||
+      (c.case_number || "").toLowerCase().includes(q) ||
+      (c.active_playbook || "").toLowerCase().includes(q);
 
     if (!matchesSearch) return false;
     if (filter === "all") return true;
     if (filter === "no_show") return c.has_no_show;
     if (filter === "warning") return c.sla_status === "warning" || c.sla_status === "breached";
-    if (filter === "escalated") return c.status.toLowerCase().includes("escalat");
+    if (filter === "escalated") return (c.status || "").toLowerCase().includes("escalat");
     if (filter === "recovering") return c.status === "recovering";
     return true;
   });
@@ -117,7 +118,7 @@ export default function RecoveryQueuePage() {
   const totalWarnings = cases.filter(
     (c) => c.sla_status === "warning" || c.sla_status === "breached"
   ).length;
-  const totalEscalated = cases.filter((c) => c.status.toLowerCase().includes("escalat")).length;
+  const totalEscalated = cases.filter((c) => (c.status || "").toLowerCase().includes("escalat")).length;
 
   return (
     <div className="space-y-6 max-w-[1200px] mx-auto pb-12">
@@ -272,9 +273,9 @@ export default function RecoveryQueuePage() {
 
               <div className="space-y-2.5 text-xs text-[#475569] my-4">
                 <div className="flex items-center gap-2">
-                  {getPlaybookIcon(c.active_playbook)}
+                  {getPlaybookIcon(c.active_playbook || "transportation_support")}
                   <span className="font-semibold text-[#0F172A] capitalize">
-                    {c.active_playbook.replace("_", " ")}
+                    {(c.active_playbook || "transportation_support").replace(/_/g, " ")}
                   </span>
                 </div>
 
@@ -283,7 +284,7 @@ export default function RecoveryQueuePage() {
                     Detected Barriers:
                   </span>
                   <span className="font-medium text-[#0F172A]">
-                    {c.barriers_detected.join(", ") || "Transportation / Caregiver Dependency"}
+                    {(c.barriers_detected || []).join(", ") || "Transportation / Caregiver Dependency"}
                   </span>
                 </div>
 

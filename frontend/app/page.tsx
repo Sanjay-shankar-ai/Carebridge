@@ -5,13 +5,18 @@ import { useRouter } from "next/navigation";
 import { useAuth, ROLE_HOME_PATHS } from "../context/AuthContext";
 
 export default function Home() {
-  const { role } = useAuth();
+  const { user, role, isLoading } = useAuth();
   const router = useRouter();
 
   useEffect(() => {
-    const dest = (role && ROLE_HOME_PATHS[role]) ? ROLE_HOME_PATHS[role] : "/coordinator";
+    if (isLoading) return;
+    if (!user || !role) {
+      router.replace("/login");
+      return;
+    }
+    const dest = ROLE_HOME_PATHS[role] || "/coordinator";
     router.replace(dest);
-  }, [role, router]);
+  }, [user, role, isLoading, router]);
 
   return (
     <div className="min-h-[60vh] flex flex-col items-center justify-center gap-3">

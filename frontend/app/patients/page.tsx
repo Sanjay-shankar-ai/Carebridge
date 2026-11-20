@@ -556,20 +556,21 @@ export default function PatientsManagementPage() {
                     </tr>
                   ) : (
                     patients.map((p) => {
-                      const stagePct = Math.round((p.current_stage_number / 14) * 100);
+                      const stageNum = p.current_stage_number || 1;
+                      const stagePct = Math.round((stageNum / 14) * 100);
                       return (
                         <tr
-                          key={p.patient_id}
+                          key={p.patient_id || p.case_id}
                           className="hover:bg-[#F8FAFC] transition cursor-pointer group"
                           onClick={() => handleOpenCase(p)}
                         >
                           {/* Patient & Case */}
                           <td className="py-3 px-4">
                             <div className="font-semibold text-xs text-[#0F172A] group-hover:text-[#0F766E] transition">
-                              {p.name}
+                              {p.name || (p as any).patient_name || "Patient"}
                             </div>
                             <div className="text-[10px] text-[#64748B] flex items-center gap-2 mt-0.5">
-                              <span>MRN: <strong className="font-mono text-[#0F172A]">{p.mrn}</strong></span>
+                              <span>MRN: <strong className="font-mono text-[#0F172A]">{p.mrn || "N/A"}</strong></span>
                               <span>•</span>
                               <span>Case: <strong className="font-mono text-[#0F172A]">{p.case_number}</strong></span>
                             </div>
@@ -579,7 +580,7 @@ export default function PatientsManagementPage() {
                           <td className="py-3 px-3">
                             <div className="flex items-center gap-2">
                               <span className="font-bold text-xs text-[#0F766E] font-mono">
-                                Stage {p.current_stage_number}/14
+                                Stage {stageNum}/14
                               </span>
                             </div>
                             <div className="w-24 bg-[#E2E8F0] rounded-full h-1.5 mt-1 overflow-hidden">
@@ -589,21 +590,21 @@ export default function PatientsManagementPage() {
                               />
                             </div>
                             <span className="text-[10px] text-[#64748B] block truncate max-w-[140px] mt-0.5">
-                              {p.current_stage_title}
+                              {p.current_stage_title || "Care Pathway Active"}
                             </span>
                           </td>
 
                           {/* Status */}
                           <td className="py-3 px-3">
                             <Badge variant="neutral" className="capitalize text-[10px] py-0 px-2 font-mono">
-                              {p.status.replace(/_/g, " ")}
+                              {(p.status || "active").replace(/_/g, " ")}
                             </Badge>
                           </td>
 
                           {/* Pending Action */}
                           <td className="py-3 px-3">
                             <span className="text-xs text-[#0F172A] font-medium block truncate max-w-[150px]">
-                              {p.pending_action}
+                              {p.pending_action || "Review Care Pathway"}
                             </span>
                             {p.needs_coordinator_action && (
                               <span className="inline-block mt-0.5 px-1.5 py-0.2 bg-[#E6F4F1] text-[#0F766E] rounded text-[9px] font-semibold">
@@ -615,14 +616,14 @@ export default function PatientsManagementPage() {
                           {/* Responsible Role */}
                           <td className="py-3 px-3">
                             <span className="capitalize text-[11px] text-[#475569] font-medium">
-                              {p.responsible_role.replace(/_/g, " ")}
+                              {(p.responsible_role || "care_coordinator").replace(/_/g, " ")}
                             </span>
                           </td>
 
                           {/* Assigned Doctor */}
                           <td className="py-3 px-3">
-                            <span className={`text-xs ${p.assigned_doctor === "Unassigned" ? "text-amber-700 italic font-medium" : "text-[#0F172A] font-medium"}`}>
-                              {p.assigned_doctor}
+                            <span className={`text-xs ${!p.assigned_doctor || p.assigned_doctor === "Unassigned" ? "text-amber-700 italic font-medium" : "text-[#0F172A] font-medium"}`}>
+                              {p.assigned_doctor || "Unassigned"}
                             </span>
                           </td>
 
