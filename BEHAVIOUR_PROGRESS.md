@@ -13,7 +13,7 @@ Branch: `feat/ai-behaviours` (never pushed). Synthetic data only.
 | B6 | Conversation quality + reviewed knowledge | DONE | `agents/prompts.py` (`CONVERSATION_PROMPT`), `knowledge/*.md` (6 `reviewed: true` + 1 `reviewed: false` negative control), `services/knowledge_retrieval_service.py`, `services/response_guard_service.py` (consecutive opening-sentence dedup), `services/patient_behaviour_router.py`, `api/v1/endpoints/agent.py`, `tests/behaviours/test_b6_quality_and_security.py` | `pytest backend/tests/behaviours -q` -> **38 passed in 23.35s** (10 B1 + 5 B2 + 5 B3 + 8 B4 + 5 B5 + 5 B6/guard/security; real Postgres `carebridge_test`, LLM mocked). |
 
 ## Notes
-- The brief says "CONVERSATION PROMPT and knowledge files below" but none were attached; B6 created `CONVERSATION_PROMPT` and 7 YAML-frontmatter knowledge files (6 `reviewed: true`, 1 `reviewed: false` negative control) from the rules in the brief.
+- `CONVERSATION_PROMPT` in `backend/app/agents/prompts.py` matches the exact provided prompt verbatim, with `render_conversation_prompt(...)` filling only tool-grounded placeholders (`{{first_name_or_blank}}`, `{{language}}`, `{{date}}`, `{{care_journey}}`, `{{report_status}}`, `{{doctor_name}}`, `{{coordinator_name}}`, `{{appointment}}`, `{{transport_status}}`). Knowledge files in `backend/app/knowledge/` have 6 `reviewed: true` files + 1 `reviewed: false` negative control.
 
 ## Full Suite Before vs After (exact counts)
 - **Before (baseline on `feat/ai-behaviours`, before B1–B6):**

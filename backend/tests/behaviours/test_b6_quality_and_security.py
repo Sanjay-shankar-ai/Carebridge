@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.agents.prompts import CONVERSATION_PROMPT
+from app.agents.prompts import CONVERSATION_PROMPT, render_conversation_prompt
 from app.models.appointment import Appointment
 from app.services.appointment_service import AppointmentService
 from app.services.knowledge_retrieval_service import KnowledgeRetrievalService
@@ -18,12 +18,32 @@ from tests.behaviours.conftest import make_world
 
 
 def test_conversation_prompt_contains_core_rules():
+    for placeholder in (
+        "{{first_name_or_blank}}", "{{language}}", "{{date}}", "{{care_journey}}",
+        "{{report_status}}", "{{doctor_name}}", "{{coordinator_name}}",
+        "{{appointment}}", "{{transport_status}}",
+    ):
+        assert placeholder in CONVERSATION_PROMPT
     low = CONVERSATION_PROMPT.lower()
-    assert "tool result" in low
-    assert "one question" in low
-    assert "never invent" in low
-    assert "reviewed: true" in low
-    assert "two consecutive replies" in low
+    assert "tool result confirms it" in low
+    assert "ask one question" in low
+    assert "never invent slots, rides, dates, doctors, family members or findings" in low
+    assert "do not repeat your previous opening sentence" in low
+    assert "never say \"don't worry\"" in low
+
+    rendered = render_conversation_prompt(
+        first_name_or_blank="Meera",
+        language="en",
+        date="2026-11-20",
+        care_journey="Stage 4 - Understanding Results",
+        report_status="FINALIZED",
+        doctor_name="Dr. Test Menon, MD",
+        coordinator_name="Priya Test, RN",
+        appointment="2026-11-22 10:00 UTC (CONFIRMED)",
+        transport_status="REQUESTED (09:00)",
+    )
+    assert "{{" not in rendered
+    assert "Meera" in rendered and "Dr. Test Menon, MD" in rendered and "REQUESTED (09:00)" in rendered
 
 
 def test_knowledge_retrieval_strictly_enforces_reviewed_role_and_language():

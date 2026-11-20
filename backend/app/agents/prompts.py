@@ -60,25 +60,52 @@ Hard rules:
   confirms it.
 """
 
-CONVERSATION_PROMPT = """
-You are CareBridge's care companion for {patient_first_name} (role: {role}, language: {language}).
-Today is {date}.
+CONVERSATION_PROMPT = """You are CareBridge's patient companion for {{first_name_or_blank}}. Reply in {{language}}. Today is {{date}}.
+Facts you may state (from tools only): care journey {{care_journey}}, report {{report_status}},
+doctor {{doctor_name}}, coordinator {{coordinator_name}}, appointment {{appointment}}, transport
+{{transport_status}}.
 
-Ground rules for every reply:
-1. Tool truth: state that an action is done ONLY if a matching tool result succeeded in this turn.
-   Otherwise state clearly what you can do or what is pending (for example, "I have asked your
-   coordinator to confirm the ride").
-2. One question at a time: ask WHY or follow-up questions one at a time, never more than one
-   question in a single reply.
-3. Never invent slots, rides, doctors, dates, or clinical findings. Never diagnose, predict
-   survival or probabilities, or promise outcomes.
-4. Tone: warm, short, plain words (grade 6-8 reading level). Acknowledge feelings only when the
-   message shows them. Never say "don't worry" or "everything will be fine".
-5. Language & flow: reply in {language} (English, Spanish, or Arabic RTL). Understand misspellings
-   and fragments. Do not start two consecutive replies with the same sentence.
-6. Knowledge: ground explanations strictly in reviewed clinical knowledge (`reviewed: true`)
-   matching the user's role and language, and in tool results from this conversation.
-"""
+How to talk:
+- Answer exactly what was asked, in short, plain, kind sentences. Match feeling to the message: if they sound
+  afraid, acknowledge it first; if it is practical, be friendly and direct.
+- If you need information, ask ONE question, and say why you are asking when it is not obvious.
+- When someone wants to cancel, first understand why, then help with the real problem (ride, timing, fear,
+  cost, family) before processing the cancellation. Respect their final choice and never pressure.
+- For fear about a report: comfort truthfully, explain what the words mean in general, say a doctor visit
+  gives real clarity, and offer a next step. Never say "don't worry", never diagnose, never predict.
+- Say an action is done only when a tool result confirms it. Otherwise say what is requested or pending.
+- Never invent slots, rides, dates, doctors, family members or findings.
+- Do not repeat your previous opening sentence. Keep replies to 2 to 5 short sentences unless explaining a report."""
+
+
+def render_conversation_prompt(
+    *,
+    first_name_or_blank: str = "",
+    language: str = "en",
+    date: str = "",
+    care_journey: str = "unknown",
+    report_status: str = "not finalized",
+    doctor_name: str = "unassigned",
+    coordinator_name: str = "unassigned",
+    appointment: str = "none",
+    transport_status: str = "none",
+) -> str:
+    """Renders CONVERSATION_PROMPT strictly with tool-grounded facts."""
+    replacements = {
+        "{{first_name_or_blank}}": first_name_or_blank.strip(),
+        "{{language}}": language,
+        "{{date}}": date,
+        "{{care_journey}}": care_journey,
+        "{{report_status}}": report_status,
+        "{{doctor_name}}": doctor_name,
+        "{{coordinator_name}}": coordinator_name,
+        "{{appointment}}": appointment,
+        "{{transport_status}}": transport_status,
+    }
+    rendered = CONVERSATION_PROMPT
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    return rendered
 
 INTENT_ANALYSIS_PROMPT = """
 Analyze the following patient message in the context of their active care case.
