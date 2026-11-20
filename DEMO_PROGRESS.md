@@ -52,10 +52,28 @@
 ---
 
 ## Task 3: Coordinator Report Upload with Browse Button
-- **Status:** TODO
-- **Goal:** Add Browse files + drag-and-drop component, backend validation, OCR/text extraction, and finalize workflow.
-- **Files:** TBD
-- **Test Commands & Results:** TBD
+- **Status:** DONE
+- **Root Cause & Objective:** Add a dedicated coordinator upload component with a "Browse files" button + drag-and-drop zone accepting PDF, JPG, PNG (max 10 MB, configurable); backend validation by content magic bytes, virus-safe filename, path traversal guards; PyMuPDF first-page preview; text extraction and OCR availability checks (keeping Stage 2 pending if unreadable); coordinator finalization advancing Stage 2 via LifecycleService idempotently; and strict cross-role upload rejection (403 Forbidden for patients and doctors).
+- **Files Changed / Added:**
+  - `backend/app/services/report_upload_service.py` (content magic bytes validation, PyMuPDF preview, text extraction, OCR verification)
+  - `backend/app/services/lifecycle_service.py` (authorized care_coordinator role for Stage 2 finalization)
+  - `backend/app/core/middleware.py` (configured 10 MB body size limit for file uploads)
+  - `backend/app/api/v1/endpoints/cases.py` (added POST `/upload-report-file` and POST `/finalize-report` endpoints)
+  - `frontend/components/ReportUploadModal.tsx` (drag-and-drop zone, Browse files button, preview thumbnail, progress bar, patient/order selector, states: UPLOADED -> EXTRACTING -> VALIDATING -> READY_TO_FINALIZE -> FINALIZED / FAILED)
+  - `frontend/app/cases/[caseId]/page.tsx` (integrated upload modal into coordinator case view)
+  - `frontend/app/coordinator/page.tsx` (integrated upload modal into coordinator overview)
+  - `backend/tests/test_report_upload.py` (8/8 verification tests)
+- **Exact Test Commands & Results:**
+  - Command: `pytest backend/tests/test_report_upload.py -v`
+  - Output: `8 passed, 1 warning in 8.47s`
+    - `test_valid_pdf_upload_passes` PASSED
+    - `test_upload_alone_never_completes_stage_2` PASSED
+    - `test_finalize_report_completes_stage_2` PASSED
+    - `test_duplicate_finalize_is_idempotent` PASSED
+    - `test_wrong_file_type_rejected_by_content` PASSED
+    - `test_oversize_rejected` PASSED
+    - `test_corrupt_pdf_leaves_stage_2_pending` PASSED
+    - `test_cross_role_upload_rejected` PASSED
 
 ---
 

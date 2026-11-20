@@ -70,8 +70,8 @@ LIFECYCLE_TRANSITIONS = {
         "stage_id": "RESULT_GENERATED",
         "title": "Diagnostic Report Generated",
         "allowed_from": [1, 2],
-        "authorized_roles": ["radiologist", "pathologist", "doctor", "clinician", "system"],
-        "required_evidence_type": ["diagnostic_report", "radiology_report", "pathology_report", "biopsy_report", "screening_result"],
+        "authorized_roles": ["radiologist", "pathologist", "doctor", "clinician", "care_coordinator", "coordinator", "system"],
+        "required_evidence_type": ["diagnostic_report", "radiology_report", "pathology_report", "biopsy_report", "screening_result", "report_finalized", "report_upload"],
         "allow_empty_evidence": False,
     },
     3: {

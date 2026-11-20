@@ -7,6 +7,7 @@ Provides:
 4. Correlation ID propagation via X-Correlation-ID / X-Workflow-ID headers.
 """
 
+import os
 import uuid
 import logging
 from typing import Callable
@@ -17,7 +18,7 @@ from app.core.correlation import set_correlation_ids, get_correlation_id, get_wo
 
 logger = logging.getLogger("carebridge.security.middleware")
 
-MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024  # 5 Megabytes
+MAX_REQUEST_BODY_BYTES = int(os.getenv("MAX_REQUEST_BODY_BYTES", 10 * 1024 * 1024))  # 10 Megabytes configurable
 
 
 class MaxRequestSizeMiddleware(BaseHTTPMiddleware):
