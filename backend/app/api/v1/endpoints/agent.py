@@ -440,13 +440,19 @@ async def generate_agent_stream(
             # -------------------------------------------------------------
             else:
                 from app.agents.specialized import ClinicalEscalationAgent
-                if ClinicalEscalationAgent.evaluate_safety_rules(req.message):
+                if ClinicalEscalationAgent.evaluate_acute_symptoms(req.message):
                     primary_intent = "urgent_clinical_escalation"
                     draft_response = (
                         "⚠️ **CRITICAL MEDICAL ALERT**: You reported symptoms that require immediate medical attention. "
                         "Please call 911 or proceed immediately to the nearest Emergency Department. "
                         "Do not wait for an online chat response."
                     )
+                elif (behaviour_result := await _run_behaviour_turn(
+                    current_user, active_session, req, detected_language
+                )) is not None:
+                    primary_intent = behaviour_result.intent
+                    draft_response = behaviour_result.reply
+                    tool_observations.extend(behaviour_result.tool_observations)
                 elif any(term in msg_lower for term in ["5 whys", "five whys", "root cause"]):
                     primary_intent = "five_whys_root_cause_analysis"
                     draft_response = (
@@ -479,12 +485,6 @@ async def generate_agent_stream(
                         "2. **Tomorrow at 2:30 PM** (Afternoon)\n\n"
                         "Which time works best for you?"
                     )
-                elif (behaviour_result := await _run_behaviour_turn(
-                    current_user, active_session, req, detected_language
-                )) is not None:
-                    primary_intent = behaviour_result.intent
-                    draft_response = behaviour_result.reply
-                    tool_observations.extend(behaviour_result.tool_observations)
                 elif len(msg_lower.split()) <= 2 and msg_lower not in ("hello", "hi", "hey") and not any(k in msg_lower for k in ["book", "report", "result", "doctor", "pain", "ride", "stage", "journey", "where"]):
                     # Low confidence ambiguous input: ask one short clarifying question, never default to booking
                     primary_intent = "clarification_needed"

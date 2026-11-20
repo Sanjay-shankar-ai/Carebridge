@@ -21,34 +21,53 @@ ACUTE_SYMPTOM_INDICATORS = [
     "நெஞ்சு வலி", "அவசரம்", "அதிக காய்ச்சல்", "கடுமையான வலி", "வீக்கம்"
 ]
 
+# Deterministic severe emotional distress / crisis triggers (always create persisted urgent clinical task)
+SEVERE_DISTRESS_INDICATORS = [
+    "can't take this anymore", "cant take this anymore", "cannot take this anymore",
+    "cannot cope", "can't cope", "cant cope", "hopeless", "i feel hopeless",
+    "suicide", "kill myself", "end my life", "end it all", "hurt myself", "self-harm", "self harm",
+    "can't go on", "cant go on", "no reason to live", "want to die", "giving up",
+    "انتحار", "فقدت الأمل", "لا أستطيع التحمل",
+    "suicidio", "sin esperanza", "no puedo más", "no puedo mas", "me siento desesperada",
+    "தற்கொலை", "உயிர் வாழ விரும்பவில்லை",
+]
+
 # Approved deterministic crisis, panic, distress, and self-harm triggers
 CRISIS_AND_DISTRESS_INDICATORS = [
     "am i going to die", "going to die", "will i die", "am i gonna die", "i am dying",
-    "die", "suicide", "hopeless", "so scared", "i am so scared", "terrified", "panic",
-    "giving up", "kill myself", "end my life", "can't go on", "no reason to live", "want to die",
-    "so terrified", "scared to death", "i feel hopeless",
+    "die", "so scared", "i am so scared", "terrified", "panic",
+    "so terrified", "scared to death",
     # Arabic
-    "هل سأموت", "سأموت", "انتحار", "فقدت الأمل", "مرعوبة جدا", "خائفة جدا", "أنا خائفة جدا", "أموت", "أشعر بالرعب",
+    "هل سأموت", "سأموت", "مرعوبة جدا", "خائفة جدا", "أنا خائفة جدا", "أموت", "أشعر بالرعب",
     # Spanish
-    "me voy a morir", "voy a morir", "suicidio", "sin esperanza", "mucho miedo", "tengo mucho miedo",
-    "estoy muy asustada", "estoy muy asustado", "morir", "me siento desesperada",
+    "me voy a morir", "voy a morir", "mucho miedo", "tengo mucho miedo",
+    "estoy muy asustada", "estoy muy asustado", "morir",
     # Tamil
-    "நான் இறந்துவிடுவேனா", "பயமாக இருக்கிறது", "தற்கொலை", "உயிர் வாழ விரும்பவில்லை"
-]
+    "நான் இறந்துவிடுவேனா", "பயமாக இருக்கிறது",
+] + SEVERE_DISTRESS_INDICATORS
 
 
 class ClinicalEscalationAgent:
     """Specialized agent for deterministic emergency clinical triage and physician escalation."""
 
     @classmethod
+    def evaluate_severe_distress(cls, message: str) -> bool:
+        """Deterministically detects severe distress, hopelessness, inability to cope, or self-harm without LLM."""
+        msg_lower = (message or "").lower().strip()
+        return any(term in msg_lower for term in SEVERE_DISTRESS_INDICATORS)
+
+    @classmethod
+    def evaluate_acute_symptoms(cls, message: str) -> bool:
+        """Deterministically detects acute physical red-flag symptoms without LLM."""
+        msg_lower = (message or "").lower().strip()
+        return any(term in msg_lower for term in ACUTE_SYMPTOM_INDICATORS)
+
+    @classmethod
     def evaluate_safety_rules(cls, message: str) -> bool:
         """Evaluates whether message contains acute red-flag symptoms or crisis/distress requiring emergency escalation."""
-        msg_lower = (message or "").lower().strip()
-        if any(term in msg_lower for term in ACUTE_SYMPTOM_INDICATORS):
-            return True
-        if any(term in msg_lower for term in CRISIS_AND_DISTRESS_INDICATORS):
-            return True
-        return False
+        return cls.evaluate_acute_symptoms(message) or any(
+            term in (message or "").lower().strip() for term in CRISIS_AND_DISTRESS_INDICATORS
+        )
 
     @classmethod
     def formulate_escalation_plan(

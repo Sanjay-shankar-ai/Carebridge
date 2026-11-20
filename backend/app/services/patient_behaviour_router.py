@@ -66,6 +66,14 @@ EXPLICIT_CANCEL_CONFIRM_PATTERNS = [
     r"\byes[\s,]+cancel\b", r"\bconfirm\s+cancel\w*\b", r"\bs[ií][\s,]+cancelar\b", r"\bنعم[\s،,]+إلغاء\b",
 ]
 
+FEAR_PATTERNS = [
+    r"\bscared\b", r"\bafraid\b", r"\bterrified\b", r"\bpanic\w*\b", r"\bfrightened\b",
+    r"\bis\s+it\s+cancer\b", r"\bdo\s+i\s+have\s+cancer\b", r"\bhave\s+cancer\b",
+    r"\bgoing\s+to\s+die\b", r"\bgonna\s+die\b", r"\bwill\s+i\s+die\b",
+    r"\btengo\s+miedo\b", r"\basustad[oa]\b", r"\bes\s+c[aá]ncer\b", r"\bvoy\s+a\s+morir\b",
+    r"\bخائف[ة]?\b", r"\bمرعوب[ة]?\b", r"\bهل\s+هو\s+سرطان\b", r"\bهل\s+سأموت\b",
+]
+
 WEEKDAY_WORDS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "weekend", "weekday"]
 
 
@@ -200,6 +208,11 @@ class PatientBehaviourRouter:
         pid = patient_id if isinstance(patient_id, uuid.UUID) else uuid.UUID(str(patient_id))
         state = cls.get_state(db, session_id, user_id, role) if session_id else {}
 
+        # B4 (Severe distress / crisis) ALWAYS takes top priority — deterministic, no LLM required
+        from app.agents.specialized.clinical_escalation_agent import ClinicalEscalationAgent
+        if ClinicalEscalationAgent.evaluate_severe_distress(message):
+            return cls._handle_severe_distress(db, pid, case_id, message, language)
+
         # Active multi-turn continuations
         flow = state.get("flow")
         if flow in ("transport_select_appt", "transport_need_address"):
@@ -212,8 +225,12 @@ class PatientBehaviourRouter:
             return cls._continue_cancel_flow(db, pid, user_id, role, session_id, message, text, state, language)
         if flow == "transport_update_details" and (
             _detect_companion(text) is not None or re.search(r"\b(yes|no|address|street|road|from)\b", text)
-        ) and not _any(REPORT_PATTERNS, text) and not _any(TRANSPORT_PATTERNS, text) and not _any(CANCEL_PATTERNS, text):
+        ) and not _any(REPORT_PATTERNS, text) and not _any(TRANSPORT_PATTERNS, text) and not _any(CANCEL_PATTERNS, text) and not _any(FEAR_PATTERNS, text):
             return cls._update_transport_details(db, pid, user_id, role, session_id, message, text, state, language)
+
+        # B4 - fear or panic about the report (check before report summary so "scared about my report" gets warm fear flow)
+        if _any(FEAR_PATTERNS, text):
+            return cls._handle_fear_about_report(db, pid, case_id, text, language)
 
         # B1 - report summary
         if _any(REPORT_PATTERNS, text):
@@ -877,6 +894,144 @@ class PatientBehaviourRouter:
         )
         return BehaviourResult(
             reply=reply, intent="appointment_cancellation", tool_observations=obs, case_id=str(appt.case_id)
+        )
+
+    # ------------------------------------------------------------------
+    # B4 - Fear, panic, and severe distress
+    # ------------------------------------------------------------------
+    @classmethod
+    def _resolve_case_and_doctor(cls, db: Session, patient_id: uuid.UUID, case_id=None):
+        from app.models.appointment import Appointment
+        from app.models.doctor_assignment import DoctorAssignment
+        from app.models.owner import CaseOwner
+
+        case = None
+        if case_id:
+            cid = case_id if isinstance(case_id, uuid.UUID) else uuid.UUID(str(case_id))
+            case = db.query(CareCase).filter(CareCase.id == cid, CareCase.patient_id == patient_id).first()
+        if not case:
+            case = db.query(CareCase).filter(CareCase.patient_id == patient_id).order_by(CareCase.created_at.desc()).first()
+
+        doctor_name = None
+        if case:
+            da = db.query(DoctorAssignment).filter(DoctorAssignment.case_id == case.id).order_by(DoctorAssignment.created_at.desc()).first()
+            if da:
+                doc_owner = db.query(CaseOwner).filter(CaseOwner.id == da.doctor_id).first()
+                if doc_owner:
+                    doctor_name = doc_owner.name
+            if not doctor_name:
+                appt = db.query(Appointment).filter(Appointment.case_id == case.id).order_by(Appointment.created_at.desc()).first()
+                if appt and appt.provider_name:
+                    doctor_name = appt.provider_name
+        if not doctor_name:
+            doc_owner = (
+                db.query(CaseOwner)
+                .filter(CaseOwner.role.in_(("primary_physician", "specialist", "doctor")), CaseOwner.is_active.is_(True))
+                .first()
+            )
+            doctor_name = doc_owner.name if doc_owner else "your assigned doctor"
+        return case, doctor_name
+
+    @classmethod
+    def _handle_fear_about_report(
+        cls, db: Session, patient_id: uuid.UUID, case_id, text: str, language: str
+    ) -> BehaviourResult:
+        case, doctor_name = cls._resolve_case_and_doctor(db, patient_id, case_id)
+        asking_cancer_or_die = bool(re.search(r"cancer|c[aá]ncer|سرطان|die|morir|سأموت", text))
+
+        if language == "es":
+            ack = "Es completamente comprensible sentir miedo o angustia mientras espera respuestas claras."
+            answer = (
+                "Un informe de detección por sí solo no puede confirmar ni descartar cáncer ni mostrar el panorama completo; "
+                "solo indica si hace falta revisar algo más de cerca."
+                if asking_cancer_or_die
+                else "Las palabras médicas de un informe solo describen lo que se ve en la imagen y por sí solas no dan el panorama completo."
+            )
+            doctor_part = f"Una consulta con {doctor_name} es lo que le dará respuestas claras y un plan seguro."
+            next_step = "¿Le gustaría que revisemos su informe despacio paso a paso, o prefiere que le ayude a ver horarios con su médico?"
+            reply = f"{ack}\n\n{answer}\n\n{doctor_part}\n\n{next_step}"
+        elif language == "ar":
+            ack = "من الطبيعي جداً أن تشعري بالخوف أو القلق أثناء انتظار إجابات واضحة."
+            answer = (
+                "التقرير وحده لا يستطيع أن يثبت أو ينفي وجود مرض ولا يعطي الصورة الكاملة؛ هو فقط يشير إلى الحاجة لمراجعة أدق."
+                if asking_cancer_or_die
+                else "المصطلحات الواردة في التقرير تصف الصورة فقط ولا تعطي الصورة الكاملة بمفردها."
+            )
+            doctor_part = f"الزيارة مع {doctor_name} هي التي ستمنحكِ إجابات حقيقية وواضحة."
+            next_step = "هل تودين أن نمر على التقرير معاً بهدوء، أم أساعدكِ في حجز أو تعديل موعد الاستشارة قريباً؟"
+            reply = f"{ack}\n\n{answer}\n\n{doctor_part}\n\n{next_step}"
+        else:
+            ack = "It makes complete sense to feel scared while you are waiting for answers."
+            if asking_cancer_or_die:
+                answer = (
+                    "A screening report or a score on its own cannot tell anyone whether a person has cancer or show the full picture. "
+                    "It simply flags an area that deserves a closer look."
+                )
+            else:
+                answer = (
+                    "Medical terms on a report only describe what was seen on the scan—a report alone cannot tell anyone the full picture."
+                )
+            doctor_part = f"A visit with your doctor, {doctor_name}, is what gives you real clarity and explains what applies to you."
+            next_step = (
+                "Would you like me to go through your report slowly with you, or help book or move your consultation soon?"
+            )
+            reply = f"{ack}\n\n{answer}\n\n{doctor_part}\n\n{next_step}"
+
+        return BehaviourResult(
+            reply=reply,
+            intent="emotional_support",
+            case_id=str(case.id) if case else None,
+        )
+
+    @classmethod
+    def _handle_severe_distress(
+        cls, db: Session, patient_id: uuid.UUID, case_id, raw_message: str, language: str
+    ) -> BehaviourResult:
+        from app.services.task_service import TaskService
+
+        case, doctor_name = cls._resolve_case_and_doctor(db, patient_id, case_id)
+        obs = []
+        if case:
+            esc_task = TaskService.create_clinical_escalation_task(
+                db=db,
+                case_id=case.id,
+                patient_id=patient_id,
+                red_flag_symptoms=["severe_emotional_distress"],
+                patient_statement=raw_message,
+                idempotency_key=f"distress_esc_{case.id}_{uuid.uuid4().hex[:8]}",
+            )
+            db.commit()
+            obs.append({
+                "tool": "create_clinical_escalation_task",
+                "success": True,
+                "result": {"task_id": str(esc_task.id), "priority": esc_task.priority},
+            })
+
+        if language == "es":
+            reply = (
+                "Siento mucho que esté pasando por un momento tan difícil, y estoy aquí con usted.\n\n"
+                f"He creado una alerta urgente para que su equipo clínico ({doctor_name} y su coordinadora) se comunique con usted.\n\n"
+                "Si siente que no está segura ahora mismo, por favor llame de inmediato a su equipo de atención o a los servicios de emergencia locales."
+            )
+        elif language == "ar":
+            reply = (
+                "أشعر بمدى صعوبة هذه اللحظة عليكِ، وأنا هنا معكِ.\n\n"
+                f"لقد أرسلتُ تنبيهاً عاجلاً لفريقكِ الطبي ({doctor_name} ومنسقة الرعاية) للتواصل معكِ.\n\n"
+                "إذا كنتِ تشعرين بعدم الأمان الآن، يرجى الاتصال فوراً بفريق رعايتكِ أو بخدمات الطوارئ المحلية."
+            )
+        else:
+            reply = (
+                "I am really sorry you are carrying so much right now, and I am right here with you.\n\n"
+                f"I have created an urgent alert for your clinical team ({doctor_name} and your care coordinator) so someone reaches out to you directly.\n\n"
+                "If you feel unsafe right now, please contact your care team or your local emergency services immediately."
+            )
+
+        return BehaviourResult(
+            reply=reply,
+            intent="urgent_clinical_escalation",
+            tool_observations=obs,
+            escalated=True,
+            case_id=str(case.id) if case else None,
         )
 
     # ------------------------------------------------------------------
