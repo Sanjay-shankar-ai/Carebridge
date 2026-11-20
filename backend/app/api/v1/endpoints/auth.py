@@ -8,10 +8,11 @@ Provides:
 """
 
 import uuid
+import logging
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field, EmailStr
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 
@@ -30,7 +31,10 @@ from app.core.security import (
     UserPrincipal,
 )
 from app.core.rate_limiter import rate_limit_login, login_rate_limiter, agent_rate_limiter
+from app.core.correlation import get_correlation_id
 from app.schemas.common import ApiResponseEnvelope
+
+logger = logging.getLogger("carebridge.auth")
 
 router = APIRouter(prefix="/auth", tags=["Authentication & Role Detection"])
 
@@ -340,98 +344,110 @@ async def login(
     Authenticates registered user using email and password.
     Retrieves trusted role strictly from the database.
     Issues cryptographic JWT containing user_id, verified_role, and expiration.
+    Returns generic non-leaking errors for invalid credentials.
     """
-    clean_identifier = req.email.strip().lower()
+    try:
+        clean_identifier = req.email.strip().lower()
 
-    # Search User table
-    stmt = select(User).where(User.email == clean_identifier)
-    res = await db.execute(stmt)
-    user = res.scalar_one_or_none()
+        # Search User table
+        stmt = select(User).where(User.email == clean_identifier)
+        res = await db.execute(stmt)
+        user = res.scalar_one_or_none()
 
-    if not user:
-        # Check alias shortcuts for convenience
-        alias_map = {
-            "doctor": "doctor@carebridge.com",
-            "doc": "doctor@carebridge.com",
-            "coordinator": "coordinator@carebridge.com",
-            "coord": "coordinator@carebridge.com",
-            "patient": "patient@carebridge.com",
+        if not user:
+            # Check alias shortcuts for convenience
+            alias_map = {
+                "doctor": "doctor@carebridge.com",
+                "doc": "doctor@carebridge.com",
+                "coordinator": "coordinator@carebridge.com",
+                "coord": "coordinator@carebridge.com",
+                "patient": "patient@carebridge.com",
+            }
+            if clean_identifier in alias_map:
+                alias_email = alias_map[clean_identifier]
+                alias_res = await db.execute(select(User).where(User.email == alias_email))
+                user = alias_res.scalar_one_or_none()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        if not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is deactivated. Please contact your care coordinator or administrator."
+            )
+
+        # Mandatory Cryptographic Password Verification
+        if not verify_password(req.password, user.password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # Resolve linked patient or case context
+        patient_id = None
+        case_id = None
+        facility = None
+        phone = None
+
+        if user.patient_id:
+            patient_id = str(user.patient_id)
+            # Find active care case (most recent first)
+            case_stmt = select(CareCase).where(CareCase.patient_id == user.patient_id).order_by(CareCase.created_at.desc())
+            case_res = await db.execute(case_stmt)
+            c = case_res.scalars().first()
+            if c:
+                case_id = str(c.id)
+
+        if user.owner_id:
+            owner_res = await db.execute(select(CaseOwner).where(CaseOwner.id == user.owner_id))
+            owner = owner_res.scalar_one_or_none()
+            if owner:
+                facility = owner.facility
+                phone = owner.phone
+
+        # Issue verified cryptographic JWT
+        token_claims = {
+            "sub": str(user.id),
+            "role": user.role,
+            "email": user.email,
+            "name": user.full_name,
         }
-        if clean_identifier in alias_map:
-            alias_email = alias_map[clean_identifier]
-            alias_res = await db.execute(select(User).where(User.email == alias_email))
-            user = alias_res.scalar_one_or_none()
+        if case_id:
+            token_claims["case_id"] = case_id
+        if patient_id:
+            token_claims["patient_id"] = patient_id
 
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid credentials. No registered user found for '{req.email}'."
+        token = create_access_token(token_claims)
+
+        return ApiResponseEnvelope.success_response(
+            data=UserProfile(
+                id=str(user.id),
+                name=user.full_name,
+                email=user.email,
+                role=user.role,
+                facility=facility or "CareBridge Health System",
+                patient_id=patient_id,
+                case_id=case_id,
+                phone=phone,
+                token=token,
+            ),
+            message=f"Welcome back, {user.full_name}"
         )
-
-    if not user.is_active:
+    except HTTPException:
+        raise
+    except Exception as exc:
+        cid = get_correlation_id() or uuid.uuid4().hex[:8]
+        logger.error(f"[CorrelationID: {cid}] Unexpected login error: {exc}", exc_info=True)
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account is deactivated. Please contact your care coordinator or administrator."
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Something went wrong, try again."
         )
-
-    # Mandatory Cryptographic Password Verification
-    if not verify_password(req.password, user.password_hash):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials. Incorrect password provided.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    # Resolve linked patient or case context
-    patient_id = None
-    case_id = None
-    facility = None
-    phone = None
-
-    if user.patient_id:
-        patient_id = str(user.patient_id)
-        # Find active care case (most recent first)
-        case_stmt = select(CareCase).where(CareCase.patient_id == user.patient_id).order_by(CareCase.created_at.desc())
-        case_res = await db.execute(case_stmt)
-        c = case_res.scalars().first()
-        if c:
-            case_id = str(c.id)
-
-    if user.owner_id:
-        owner_res = await db.execute(select(CaseOwner).where(CaseOwner.id == user.owner_id))
-        owner = owner_res.scalar_one_or_none()
-        if owner:
-            facility = owner.facility
-            phone = owner.phone
-
-    # Issue verified cryptographic JWT
-    token_claims = {
-        "sub": str(user.id),
-        "role": user.role,
-        "email": user.email,
-        "name": user.full_name,
-    }
-    if case_id:
-        token_claims["case_id"] = case_id
-    if patient_id:
-        token_claims["patient_id"] = patient_id
-
-    token = create_access_token(token_claims)
-
-    return ApiResponseEnvelope.success_response(
-        data=UserProfile(
-            id=str(user.id),
-            name=user.full_name,
-            email=user.email,
-            role=user.role,
-            facility=facility or "CareBridge Health System",
-            patient_id=patient_id,
-            case_id=case_id,
-            phone=phone,
-            token=token,
-        ),
-        message=f"Welcome back, {user.full_name}"
-    )
 
 
 # ------------------------------------------------------------------------------
