@@ -41,6 +41,21 @@ class PatientCommunicationAgent:
         return case_context.get("current_owner_name") or "Priya Nair, RN"
 
     @classmethod
+    def _resolve_patient_first_name(cls, patient_context: Dict[str, Any]) -> str:
+        first = patient_context.get("first_name")
+        if first and first.strip() and first != "Valued Patient":
+            return first.strip()
+        full = patient_context.get("full_name")
+        if full and full.strip() and full != "Valued Patient":
+            parts = full.strip().split()
+            if parts:
+                return parts[0]
+        name = patient_context.get("name")
+        if name and name.strip() and name != "Valued Patient":
+            return name.strip().split()[0]
+        return ""
+
+    @classmethod
     def explain_finding(
         cls,
         finding_code: str,
@@ -238,7 +253,9 @@ class PatientCommunicationAgent:
         (5) ONE gentle next step.
         """
         msg_lower = (message or "").lower()
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        first_name = cls._resolve_patient_first_name(patient_context)
+        patient_name = first_name or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
+        p_display = f", {patient_name}" if patient_name else ""
         doc_name = cls._resolve_doctor_name(case_context)
         coord_name = cls._resolve_coordinator_name(case_context)
         screening_type = case_context.get("screening_type", "mammogram")
@@ -259,10 +276,77 @@ class PatientCommunicationAgent:
             or bool(case_context.get("finding_summary"))
         )
 
-        # 1. "What does my report say?" / "my report what saying" / "what does my screening result mean?"
+        # 0. "Where am I in my care journey?" / "What stage am I in?"
+        if any(term in msg_lower for term in [
+            "where am i in my care journey", "where am i in my journey", "where am i in the care journey",
+            "where am i in journey", "where am i right now", "where am i", "what stage am i in",
+            "what is my stage", "care journey status", "my care journey", "care journey",
+            "how about my health", "my care pathway", "care pathway", "current stage",
+            "dónde estoy en mi proceso", "dónde estoy en mi camino", "en qué etapa estoy",
+            "أين أنا في رحلتي العلاجية", "ما هي مرحلتي الحالية", "أين وصلت في رحلتي",
+            "என் மருத்துவப் பயணத்தில் நான் எங்கே இருக்கிறேன்", "நான் எந்த நிலையில் உள்ளேன்"
+        ]) or (
+            ("where" in msg_lower or "stage" in msg_lower or "status" in msg_lower or "journey" in msg_lower)
+            and any(w in msg_lower for w in ["journey", "care", "pathway", "stage", "step"])
+        ):
+            curr_stage_num = case_context.get("current_stage_number")
+            if not curr_stage_num and stages:
+                active_s = next((s for s in stages if s.get("status") in ("active", "in_progress")), None)
+                curr_stage_num = active_s.get("stage_number", 4) if active_s else 4
+            else:
+                curr_stage_num = curr_stage_num or 4
+
+            if lang == "es":
+                return (
+                    f"Comprendo lo importante que es tener una orientación clara y paso a paso sobre su proceso de atención{p_display}.\n\n"
+                    f"Actualmente se encuentra en la Etapa {curr_stage_num} de su plan de atención:\n"
+                    f"• Pasos completados: Su mamografía de detección fue realizada, y su informe diagnóstico oficial ha sido finalizado.\n"
+                    f"• Paso actual (Etapa 4 - Comprensión de resultados): Su informe se encuentra listo en su expediente para que lo revise junto a su equipo médico.\n"
+                    f"• Próximo paso: Una consulta clínica con su médico tratante, el {doc_name}, para revisar las imágenes y planificar los pasos recomendados.\n\n"
+                    f"Este canal de conversación le ayuda a orientarse en sus etapas y entender los términos médicos, pero sólo el {doc_name} puede brindar un diagnóstico definitivo.\n\n"
+                    f"Su coordinadora de atención, {coord_name}, y el {doc_name} están acompañándole en cada paso de esta evaluación.\n\n"
+                    f"¿Le gustaría que le explique lo que dice su informe o prefiere verificar horarios de consulta con el {doc_name}?"
+                )
+            elif lang == "ar":
+                return (
+                    f"أتفهم تماماً رغبتكِ في الحصول على رؤية واضحة ومحددة لخطوات رحلتكِ العلاجية الحالية{p_display}.\n\n"
+                    f"أنتِ حالياً في المرحلة {curr_stage_num} من خطة رعايتكِ:\n"
+                    f"• الخطوات المكتملة: تم إجراء فحص الماموجرام، واكتمال التقرير الإشعاعي التشخيصي وتوثيقه رسمياً في سجلكِ.\n"
+                    f"• مرحلتكِ الحالية (المرحلة 4 - فهم النتائج): تقريركِ جاهز للمراجعة والاستيعاب بالتعاون مع فريق رعايتكِ.\n"
+                    f"• الخطوة القادمة: استشارة سريرية مع طبيبكِ المعالج، {doc_name}، لمناقشة نتائج الفحص بالتفصيل وبحث الخطوات الطبية التالية.\n\n"
+                    f"تساعدكِ هذه المحادثة في متابعة مراحل الرعاية وفهم المصطلحات، ولكن الطبيب المعالج وحده {doc_name} المخول بتقديم التقييم والتشخيص الطبي.\n\n"
+                    f"منسقة رعايتكِ {coord_name} وطبيبكِ {doc_name} يتابعون كل خطوة معكِ باهتمام.\n\n"
+                    f"هل تودين أن أشرح لكِ ما ورد في تقريركِ، أم ترغبين في المساعدة لمعرفة المواعيد المتاحة للتحدث مع {doc_name}؟"
+                )
+            elif lang == "ta":
+                return (
+                    f"உங்கள் மருத்துவப் பயணத்தில் நீங்கள் எந்த நிலையில் உள்ளீர்கள் என்பதைத் தெளிவாக அறிந்துகொள்ள விரும்புவது முற்றிலும் இயல்பானது{p_display}.\n\n"
+                    f"தற்போது நீங்கள் உங்களின் பராமரிப்புப் பயணத்தில் நிலை {curr_stage_num}-ல் உள்ளீர்கள்:\n"
+                    f"• பூர்த்தி செய்யப்பட்டவை: தங்களின் மேமோகிராம் பரிசோதனை முடிக்கப்பட்டு, அதிகாரப்பூர்வ அறிக்கை இறுதி செய்யப்பட்டுள்ளது.\n"
+                    f"• தற்போதைய நிலை (நிலை 4 - முடிவுகளைப் புரிந்துகொள்ளுதல்): மருத்துவக் குழுவுடன் கலந்தாலோசிக்க உங்கள் அறிக்கை தயாராக உள்ளது.\n"
+                    f"• அடுத்த கட்டம்: தங்களின் மருத்துவர் {doc_name}-உடன் நேரடி மருத்துவ ஆலோசனை மேற்கொண்டு அடுத்தகட்ட முடிவுகளைத் தீர்மானித்தல்.\n\n"
+                    f"இந்த உரையாடல் உங்கள் நிலையை அறிய உதவும்; எனினும் மருத்துவர் {doc_name} மட்டுமே நேரடி மருத்துவ ஆலோசனைகளை வழங்க முடியும்.\n\n"
+                    f"மருத்துவ ஒருங்கிணைப்பாளர் {coord_name} மற்றும் மருத்துவர் {doc_name} உங்களுக்குத் துணையாக உள்ளனர்.\n\n"
+                    f"உங்கள் அறிக்கையில் உள்ள விவரங்களை விளக்கவா, அல்லது மருத்துவர் {doc_name}-யிடம் ஆலோசனை பெற நேரத்தை ஒதுக்கவா?"
+                )
+
+            # English default
+            return (
+                f"I understand how important it is to have a clear, step-by-step view of where you are in your care journey{p_display}.\n\n"
+                f"You are currently at Stage {curr_stage_num} in your care pathway:\n"
+                f"• Completed steps: Your screening {screening_type} was completed, and your official diagnostic report has been finalized and uploaded.\n"
+                f"• Current step (Stage 4 - Understanding Results): Your report is ready in your record for you and your care team to review together.\n"
+                f"• What comes next: A clinical consultation with your attending specialist, {doc_name}, to discuss your imaging findings and plan any recommended next steps.\n\n"
+                f"A chat conversation helps track your timeline and milestones, but only {doc_name} can provide medical answers and determine clinical recommendations.\n\n"
+                f"Your care coordinator, {coord_name}, and {doc_name} are right here to guide you through every step of this journey.\n\n"
+                f"Would you like me to walk you through what is documented in your report, or help you check appointment openings to speak with {doc_name}?"
+            )
+
+        # 1. "What does my report say?" / "my report what saying" / "what does my screening result mean?" / "explain my report"
         if any(term in msg_lower for term in [
             "report what saying", "my report what saying", "what report saying", "my report saying",
             "what does my report say", "what does my screening result mean", "result mean",
+            "explain my report", "explain report", "can you explain my report", "explain my results", "explain findings",
             "what is my result", "what does my result", "que dice mi informe", "qué significa mi informe",
             "ماذا يقول تقريري", "ماذا يعني تقريري"
         ]):
@@ -354,7 +438,11 @@ class PatientCommunicationAgent:
             )
 
         # 4. "When is my appointment?"
-        if any(term in msg_lower for term in ["when is my appointment", "appointment date", "time is my appointment", "my upcoming appointment", "when is the appointment"]):
+        if any(term in msg_lower for term in [
+            "when is my appointment", "when is my next appointment", "next appointment", "upcoming appointment",
+            "appointment date", "time is my appointment", "my upcoming appointment", "when is the appointment",
+            "cuándo es mi cita", "mi próxima cita", "متى موعدي", "موعدي القادم"
+        ]):
             appt = case_context.get("upcoming_appointment") or {}
             if not appt and case_context.get("appointment_history"):
                 appt = case_context.get("appointment_history")[-1]
@@ -444,7 +532,7 @@ class PatientCommunicationAgent:
     ) -> CoordinationPlan:
         """Formulates an empathetic counselling communication plan with verified 5-step response."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = cls._resolve_patient_first_name(patient_context) or patient_context.get("full_name") or ""
         lang = cls._resolve_lang(intent, patient_context)
         finding_code = case_context.get("finding_code", "BI-RADS 4")
         screening_type = case_context.get("screening_type", "Mammogram")
@@ -510,7 +598,7 @@ class PatientCommunicationAgent:
     ) -> CoordinationPlan:
         """Explains the clinical rationale behind the specialist referral in 5-step counselling tone."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = cls._resolve_patient_first_name(patient_context) or patient_context.get("full_name") or ""
         lang = cls._resolve_lang(intent, patient_context)
         finding_code = case_context.get("finding_code", "BI-RADS 4")
         screening_type = case_context.get("screening_type", "mammogram")

@@ -231,3 +231,19 @@ def test_multilingual_arabic_counselling(case_context):
 
     assert_counselling_safety(reply)
     assert "أرجون مينون" in reply or "طبيب" in reply
+
+
+def test_golden_care_journey_status(patient_context, case_context):
+    """Suggested Chip: 'Where am I in my care journey?' returns empathetic longitudinal stage orientation."""
+    msg = "Where am I in my care journey?"
+    intent = CognitiveEngine.analyze_intent(msg, patient_context, case_context, {})
+    plan = CognitiveEngine.formulate_plan(intent, patient_context, case_context, {})
+    reply = plan.patient_response_draft
+
+    assert_counselling_safety(reply)
+    assert "Meera" in reply
+    assert "Stage 4" in reply
+    assert "Dr. Arjun Menon" in reply
+    assert "Priya Nair" in reply
+    assert "Valued Patient" not in reply
+

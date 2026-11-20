@@ -196,7 +196,26 @@ class CognitiveEngine:
                         parsed.primary_intent = "referral_inquiry"
                     elif any(term in msg_l for term in ["i want to wait", "want to wait", "can i wait", "hold off", "wait a bit"]):
                         parsed.primary_intent = "referral_deferral"
-                    elif any(term in msg_l for term in ["my report what saying", "what report saying", "report what saying", "my report saying", "what does my report say", "que dice mi informe", "ماذا يقول تقريري"]):
+                    elif any(term in msg_l for term in [
+                        "where am i in my care journey", "where am i in my journey", "where am i in the care journey",
+                        "where am i in journey", "where am i right now", "where am i", "what stage am i in",
+                        "what is my stage", "care journey status", "my care journey", "care journey",
+                        "how about my health", "my care pathway", "care pathway", "current stage",
+                        "dónde estoy en mi proceso", "dónde estoy en mi camino", "en qué etapa estoy",
+                        "أين أنا في رحلتي العلاجية", "ما هي مرحلتي الحالية", "أين وصلت في رحلتي",
+                        "என் மருத்துவப் பயணத்தில் நான் எங்கே இருக்கிறேன்", "நான் எந்த நிலையில் உள்ளேன்"
+                    ]) or (
+                        ("where" in msg_l or "stage" in msg_l or "status" in msg_l or "journey" in msg_l)
+                        and any(w in msg_l for w in ["journey", "care", "pathway", "stage", "step"])
+                    ):
+                        parsed.primary_intent = "case_context_inquiry"
+                        parsed.inquiry_topic = "care_journey"
+                    elif any(term in msg_l for term in [
+                        "my report what saying", "what report saying", "report what saying", "my report saying",
+                        "what does my report say", "explain my report", "explain report", "can you explain my report",
+                        "explain my results", "explain findings", "que dice mi informe", "qué significa mi informe",
+                        "ماذا يقول تقريري", "ماذا يعني تقريري"
+                    ]):
                         parsed.primary_intent = "case_context_inquiry"
                         parsed.inquiry_topic = "birads"
                     elif any(term in msg_l for term in ["doctor not call", "not call me yet", "no call from doctor", "doctor call me yet", "no call yet", "doctor not call me yet", "el doctor no me ha llamado", "لم يتصل بي الطبيب"]):
@@ -235,7 +254,7 @@ class CognitiveEngine:
         conversation_context: Dict[str, Any]
     ) -> CoordinationPlan:
         """Formulates an empathetic, natural conversational greeting without administrative tool calls."""
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = intent.detected_language or patient_context.get("preferred_language", "en")
         finding_code = case_context.get("finding_code", "screening finding")
 
@@ -706,19 +725,32 @@ class CognitiveEngine:
         elif any(term in msg_lower for term in [
             "my report what saying", "what report saying", "report what saying", "my report saying",
             "what my report say", "what report say", "what does my report say",
+            "explain my report", "explain report", "can you explain my report", "explain my results", "explain findings",
             "que dice mi informe", "qué significa mi informe", "ماذا يقول تقريري", "ماذا يعني تقريري",
             "screening result mean", "result mean", "what is my result", "what does my result",
+            "where am i in my care journey", "where am i in my journey", "where am i in the care journey",
+            "where am i in journey", "where am i right now", "where am i", "what stage am i in",
+            "what is my stage", "care journey status", "my care journey", "care journey",
+            "how about my health", "my care pathway", "care pathway", "current stage",
+            "dónde estoy en mi proceso", "dónde estoy en mi camino", "en qué etapa estoy",
+            "أين أنا في رحلتي العلاجية", "ما هي مرحلتي الحالية", "أين وصلت في رحلتي",
+            "என் மருத்துவப் பயணத்தில் நான் எங்கே இருக்கிறேன்", "நான் எந்த நிலையில் உள்ளேன்",
             "why does my doctor recommend", "why do i need further evaluation", "recommend further evaluation", "why further evaluation",
             "referral been accepted", "referral accepted", "has my referral", "status of my referral", "is my referral accepted",
-            "when is my appointment", "appointment date", "time is my appointment", "my upcoming appointment", "when is the appointment",
+            "when is my appointment", "when is my next appointment", "next appointment", "appointment date", "time is my appointment", "my upcoming appointment", "when is the appointment",
             "expect during my consultation", "expect during consultation", "what to expect", "what happens during consultation",
             "what did my doctor recommend", "doctor's recommendation", "doctor recommend", "what did doctor say",
             "what happens next in my treatment", "next in my treatment", "treatment next steps",
             "when is my next follow-up", "next follow-up", "follow-up date", "when is follow up",
             "have all my care steps been completed", "all care steps completed", "all my care steps", "care steps been completed", "is my care completed"
-        ]):
+        ]) or (
+            ("where" in msg_lower or "stage" in msg_lower or "status" in msg_lower or "journey" in msg_lower)
+            and any(w in msg_lower for w in ["journey", "care", "pathway", "stage", "step"])
+        ):
             primary_intent = "case_context_inquiry"
-            if any(term in msg_lower for term in ["report", "result", "birads", "bi-rads", "informe", "resultado", "تقرير", "نتيجة"]):
+            if any(term in msg_lower for term in ["care journey", "journey", "where am i", "stage", "pathway", "etapa", "رحلتي", "مرحلتي", "how about my health", "health"]):
+                inquiry_topic = "care_journey"
+            elif any(term in msg_lower for term in ["report", "result", "birads", "bi-rads", "informe", "resultado", "تقرير", "نتيجة", "explain"]):
                 inquiry_topic = "birads"
         elif any(term in msg_lower for term in ["cancel my appointment", "refuse", "don't want to come", "won't come", "stop calling", "leave me alone"]):
             primary_intent = "appointment_cancellation_and_refusal"
@@ -828,7 +860,7 @@ class CognitiveEngine:
     ) -> CoordinationPlan:
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
         patient_id = str(patient_context.get("patient_id") or patient_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = intent.detected_language or patient_context.get("preferred_language", "en")
         finding_code = case_context.get("finding_code", "abnormal finding")
         actions: List[ProposedAction] = []

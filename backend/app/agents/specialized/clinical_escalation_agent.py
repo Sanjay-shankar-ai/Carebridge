@@ -59,7 +59,7 @@ class ClinicalEscalationAgent:
     ) -> CoordinationPlan:
         """Formulates an immediate Level 2 emergency/distress escalation plan with 5-step counselling."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = intent.detected_language or patient_context.get("preferred_language", "en")
 
         cr = case_context.get("clinical_review") or {}

@@ -37,9 +37,10 @@ class RecoveryAgent:
     ) -> CoordinationPlan:
         """Formulates a recovery plan addressing transportation, caregiver, or scheduling barriers."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
-        facility = case_context.get("facility") or "Clinic A - Women's Specialty Breast Center"
+        doc_name = case_context.get("assigned_doctor_name") or case_context.get("doctor_name") or "Dr. Arjun Menon"
+        facility = case_context.get("facility") or "CareBridge Demo Clinic"
         specialty = case_context.get("specialty") or "Breast Oncology"
 
         actions: List[ProposedAction] = [
@@ -81,16 +82,55 @@ class RecoveryAgent:
             )
         ]
 
-        if lang == "ta":
-            msg = (
-                f"கவலைப்பட வேண்டாம் {patient_name}. உங்கள் குடும்பத்தாரின் வருகைக்கு ஏற்ப நாங்கள் மருத்துவரை சந்திக்கும் "
-                "நேரத்தை மாற்றி அமைக்கிறோம். அவர் எப்போது ஊரிலிருந்து திரும்புவார் என்று கூற இயலுமா? அதற்கேற்ப புதிய நேரத்தை ஒதுக்குகிறோம்."
-            )
+        p_disp = f", {patient_name}" if patient_name else ""
+        has_transit_barrier = any(b.barrier_type in ("transportation", "transit", "travel", "ride") for b in intent.detected_barriers)
+        has_caregiver_barrier = any(b.barrier_type in ("caregiver", "family") for b in intent.detected_barriers)
+
+        if has_transit_barrier and not has_caregiver_barrier:
+            if lang == "ta":
+                msg = (
+                    f"போக்குவரத்து வசதி பெறுவது சில நேரங்களில் கடினமாக இருக்கும் என்பதை நாங்கள் புரிந்துகொள்கிறோம்{p_disp}. "
+                    "மருத்துவமனைக்கு வந்து செல்ல போக்குவரத்து உதவி மற்றும் பயண வவுச்சர்களை எங்களால் ஏற்பாடு செய்ய முடியும். "
+                    "உங்களுக்கு இந்த உதவி தேவைப்படுகிறதா?"
+                )
+            elif lang == "es":
+                msg = (
+                    f"Comprendemos que conseguir transporte para asistir a su consulta puede ser difícil{p_disp}. "
+                    "En CareBridge podemos coordinar vales de transporte clínico o asistencia de viaje para asegurar su traslado seguro. "
+                    "¿Desea que organicemos este apoyo para su próxima visita?"
+                )
+            elif lang == "ar":
+                msg = (
+                    f"نتفهم تماماً أن تأمين وسيلة مواصلات للوصول إلى العيادة قد يمثل تحدياً{p_disp}. "
+                    "يمكننا التنسيق لتوفير قسائم مواصلات طبية تضمن وصولكِ بأمان. "
+                    "هل تودين أن نقوم بترتيب مساعدة في المواصلات لموعدكِ القادم؟"
+                )
+            else:
+                msg = (
+                    f"We understand that arranging transportation can feel challenging while navigating care{p_disp}. "
+                    "Our coordination team can provide medical ride assistance or transit vouchers so you can attend safely. "
+                    "Would you like us to arrange transportation support for your upcoming clinic visit?"
+                )
         else:
-            msg = (
-                f"We completely understand, {patient_name}. Please do not worry. We will coordinate with the clinic to reschedule "
-                "your consultation so your caregiver or family member can safely accompany you. Could you share what day they return?"
-            )
+            if lang == "ta":
+                msg = (
+                    f"உங்கள் நிலைமையை நாங்கள் முழுமையாகப் புரிந்துகொள்கிறோம்{p_disp}. உங்கள் குடும்பத்தாரின் வருகைக்கு ஏற்ப நாங்கள் மருத்துவரை சந்திக்கும் "
+                    "நேரத்தை மாற்றி அமைக்கிறோம். அவர் எப்போது ஊரிலிருந்து திரும்புவார் என்று கூற இயலுமா? அதற்கேற்ப புதிய நேரத்தை ஒதுக்குகிறோம்."
+                )
+            elif lang == "es":
+                msg = (
+                    f"Comprendemos perfectamente su situación{p_disp}. Coordinaremos con la clínica para reprogramar su consulta "
+                    "de modo que su familiar o cuidador pueda acompañarle con tranquilidad. ¿Podría indicarnos qué día estarán de regreso?"
+                )
+            elif lang == "ar":
+                msg = (
+                    f"نتفهم تماماً ظروفكِ{p_disp}. سنقوم بالتنسيق مع العيادة لتعديل موعد استشارتكِ بحيث يتمكن مرافقكِ من الحضور معكِ براحة. هل يمكنكِ إعلامنا بتاريخ عودتهم؟"
+                )
+            else:
+                msg = (
+                    f"We completely understand how important family and caregiver support is{p_disp}. We will coordinate with the clinic to reschedule "
+                    "your consultation so your caregiver or family member can safely accompany you. Could you share what day they return?"
+                )
 
         return CoordinationPlan(
             goal="Resolve transportation/caregiver barrier and maintain screening-to-care SLA continuity.",
@@ -109,7 +149,7 @@ class RecoveryAgent:
     ) -> CoordinationPlan:
         """Handles financial, cost, or childcare assistance requests."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
         barrier_type = "financial" if any(b.barrier_type == "financial" for b in intent.detected_barriers) else "childcare_family"
 
@@ -169,9 +209,10 @@ class RecoveryAgent:
     ) -> CoordinationPlan:
         """Formulates proactive outreach recovery plan following a missed appointment."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
-        facility = case_context.get("facility") or "Clinic A - Women's Specialty Breast Center"
+        doc_name = case_context.get("assigned_doctor_name") or case_context.get("doctor_name") or "Dr. Arjun Menon"
+        facility = case_context.get("facility") or "CareBridge Demo Clinic"
         specialty = case_context.get("specialty") or "Breast Oncology"
 
         actions: List[ProposedAction] = [
@@ -215,14 +256,14 @@ class RecoveryAgent:
 
         if lang == "ta":
             msg = (
-                f"மருத்துவரை சந்திக்க முடியாததை பற்றி கவலைப்பட வேண்டாம் {patient_name}. "
-                "தங்களின் உடல்நலம் எங்களுக்கு மிக முக்கியம். டாக்டர் அரிஸ் தோர்ன் அவர்களின் மையத்தில் "
+                f"மருத்துவரை சந்திக்க முடியாத நிலை ஏற்பட்டதை நாங்கள் உணர்கிறோம் {patient_name}. "
+                f"தங்களின் உடல்நலம் எங்களுக்கு மிக முக்கியம். டாக்டர் {doc_name} அவர்களின் மையத்தில் "
                 "அடுத்த சில நாட்களில் உள்ள புதிய நேரங்களில் எப்போது உங்களால் வர இயலும்?"
             )
         else:
             msg = (
-                f"We noticed you were unable to make your appointment, {patient_name}. Please do not worry—we understand unexpected things arise! "
-                "Because following up on your screening is important, we have held priority slots with Dr. Aris Thorne next week. "
+                f"We noticed you were unable to make your appointment, {patient_name}. We understand unexpected things arise and our team is right here with you. "
+                f"Because following up on your screening is important, we have held priority slots with {doc_name} next week. "
                 "Would morning or afternoon work better for you to reschedule?"
             )
 
@@ -243,7 +284,7 @@ class RecoveryAgent:
     ) -> CoordinationPlan:
         """Handles explicit patient cancellation or care drop-out risk."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
         appointment_id = case_context.get("upcoming_appointment_id") or str(case_context.get("appointment_id") or "")
 
@@ -297,7 +338,7 @@ class RecoveryAgent:
     ) -> CoordinationPlan:
         """Handles respectful patient deferral of referral or consultation without coercion or false acceptance."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
         finding_code = case_context.get("finding_code", "BI-RADS 4")
 

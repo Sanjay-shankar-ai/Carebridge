@@ -37,9 +37,10 @@ class CareCoordinationAgent:
         """Formulates an appointment search, slot proposal, and booking coordination plan."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
         patient_id = str(patient_context.get("id") or patient_context.get("patient_id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
-        facility = case_context.get("facility") or "Clinic A - Women's Specialty Breast Center"
+        doc_name = case_context.get("assigned_doctor_name") or case_context.get("doctor_name") or "Dr. Arjun Menon"
+        facility = case_context.get("facility") or "CareBridge Demo Clinic"
         specialty = case_context.get("specialty") or "Breast Oncology"
         raw_msg = (intent.raw_query or "").lower()
 
@@ -98,7 +99,7 @@ class CareCoordinationAgent:
                         "case_id": case_id,
                         "patient_id": patient_id,
                         "facility": facility,
-                        "provider_name": "Dr. Aris Thorne",
+                        "provider_name": doc_name,
                         "appointment_type": "Diagnostic Evaluation",
                         "scheduled_time": requested_timing,
                         "status": "pending_approval",
@@ -118,7 +119,7 @@ class CareCoordinationAgent:
                         "case_id": case_id,
                         "patient_id": patient_id,
                         "facility": facility,
-                        "provider_name": "Dr. Aris Thorne",
+                        "provider_name": doc_name,
                         "appointment_type": "Diagnostic Evaluation",
                         "scheduled_time": "tomorrow at 10:00 AM" if "tomorrow" in raw_msg else "Friday at 9:00 AM",
                         "status": "pending_approval",
@@ -152,7 +153,7 @@ class CareCoordinationAgent:
         if lang == "ta":
             msg = (
                 f"கண்டிப்பாக {patient_name}, மருத்துவ சந்திப்பை பதிவு செய்ய நான் உதவுகிறேன். "
-                "டாக்டர் அரிஸ் தோர்ன் அவர்களின் Clinic A மையத்தில் செவ்வாய் காலை 10:30 மணி மற்றும் "
+                f"டாக்டர் {doc_name} அவர்களின் {facility} மையத்தில் செவ்வாய் காலை 10:30 மணி மற்றும் "
                 "வியாழன் மதியம் 2:00 மணி ஆகிய நேரங்களில் இடங்கள் உள்ளன. இதில் எந்த நேரம் உங்களுக்கு வசதியாக இருக்கும்? "
                 "உங்கள் விருப்பத்தை பதிவு செய்தவுடன் மருத்துவக் குழுவின் ஒப்புதலுடன் இறுதி செய்யப்படும்."
             )
@@ -160,7 +161,7 @@ class CareCoordinationAgent:
             if requested_timing:
                 msg = (
                     f"¡Con gusto le ayudaré a reservar su cita para {requested_timing}, {patient_name}! "
-                    f"He generado una solicitud de reserva para {requested_timing} con el Dr. Aris Thorne en {facility}. "
+                    f"He generado una solicitud de reserva para {requested_timing} con el {doc_name} en {facility}. "
                     "Nuestro equipo clínico y su coordinadora Priya Nair revisarán este horario para confirmar su cita. "
                     "Como referencia inmediata, también contamos con horarios confirmados el martes a las 10:30 AM y el jueves a las 2:00 PM. "
                     f"¿Desea que procedamos con {requested_timing} o prefiere alguno de los otros horarios?"
@@ -168,7 +169,7 @@ class CareCoordinationAgent:
             else:
                 msg = (
                     f"¡Con gusto le ayudaré a reservar su cita, {patient_name}! "
-                    f"He ubicado espacios diagnósticos disponibles con el Dr. Aris Thorne en {facility}. "
+                    f"He ubicado espacios diagnósticos disponibles con el {doc_name} en {facility}. "
                     "Los horarios disponibles incluyen el martes a las 10:30 AM y el jueves a las 2:00 PM. "
                     "¿Cuál de estos horarios se adapta mejor a su conveniencia?"
                 )
@@ -176,7 +177,7 @@ class CareCoordinationAgent:
             if requested_timing:
                 msg = (
                     f"يسعدني جداً مساعدتك في حجز موعدك في {requested_timing} يا {patient_name}! "
-                    f"لقد رفعت طلب حجز مبدئي لـ {requested_timing} مع الدكتور أريس ثورن في {facility}. "
+                    f"لقد رفعت طلب حجز مبدئي لـ {requested_timing} مع {doc_name} في {facility}. "
                     "سيقوم فريقنا الطبي ومنسقة رعايتك بريا ناير بمراجعة هذا الموعد لتأكيده. "
                     "للعلم، تتوفر لدينا أيضاً مواعيد مؤكدة يوم الثلاثاء الساعة 10:30 صباحاً والخميس الساعة 2:00 ظهراً. "
                     f"هل تود أن نؤكد موعد {requested_timing} أم تفضل أحد المواعيد الأخرى؟"
@@ -184,7 +185,7 @@ class CareCoordinationAgent:
             else:
                 msg = (
                     f"يسعدني جداً مساعدتك في حجز موعدك يا {patient_name}! "
-                    f"لقد وجدت مواعيد تشخيصية قادمة مع الدكتور أريس ثورن في {facility}. "
+                    f"لقد وجدت مواعيد تشخيصية قادمة مع {doc_name} في {facility}. "
                     "المواعيد المتاحة تشمل يوم الثلاثاء الساعة 10:30 صباحاً والخميس الساعة 2:00 ظهراً. "
                     "هل يناسبك أي من هذين الموعدين؟"
                 )
@@ -192,7 +193,7 @@ class CareCoordinationAgent:
             if requested_timing:
                 msg = (
                     f"I would be glad to help you book your appointment for {requested_timing}, {patient_name}! "
-                    f"I have submitted a booking request for {requested_timing} with Dr. Aris Thorne at {facility}. "
+                    f"I have submitted a booking request for {requested_timing} with {doc_name} at {facility}. "
                     "Our clinical team and your care coordinator Priya Nair are reviewing this slot to confirm your reservation. "
                     "For immediate reference, our confirmed diagnostic openings also include Tuesday at 10:30 AM and Thursday at 2:00 PM. "
                     f"Would you like us to proceed with {requested_timing}, or would one of the other slots be better for you?"
@@ -200,7 +201,7 @@ class CareCoordinationAgent:
             else:
                 msg = (
                     f"I would be glad to help you book your appointment, {patient_name}! "
-                    f"I have located upcoming diagnostic openings with Dr. Aris Thorne at {facility}. "
+                    f"I have located upcoming diagnostic openings with {doc_name} at {facility}. "
                     "Available slots include Tuesday at 10:30 AM and Thursday at 2:00 PM. Would either of these times work well for you? "
                     "Once you select an option, our clinical team will review and confirm your reservation."
                 )
@@ -222,7 +223,7 @@ class CareCoordinationAgent:
     ) -> CoordinationPlan:
         """Handles delayed referral investigations with ownership notifications."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
 
         actions: List[ProposedAction] = [
@@ -344,9 +345,10 @@ class CareCoordinationAgent:
     ) -> CoordinationPlan:
         """Formulates a plan to retrieve and present alternative appointment slots."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
-        facility = case_context.get("facility") or "Clinic A - Women's Specialty Breast Center"
+        doc_name = case_context.get("assigned_doctor_name") or case_context.get("doctor_name") or "Dr. Arjun Menon"
+        facility = case_context.get("facility") or "CareBridge Demo Clinic"
         specialty = case_context.get("specialty") or "Breast Oncology"
 
         actions: List[ProposedAction] = [
@@ -381,65 +383,65 @@ class CareCoordinationAgent:
         if pref_topic == "morning":
             if lang == "ta":
                 msg = (
-                    f"நிச்சயமாக {patient_name}! டாக்டர் அரிஸ் தோர்ன் அவர்களின் Clinic A மையத்தில் கூடுதல் காலை நேரங்கள் கிடைக்கின்றன: "
+                    f"நிச்சயமாக {patient_name}! டாக்டர் {doc_name} அவர்களின் {facility} மையத்தில் கூடுதல் காலை நேரங்கள் கிடைக்கின்றன: "
                     "வெள்ளிக்கிழமை காலை 9:00 மணி மற்றும் திங்கட்கிழமை காலை 10:30 மணி. இவற்றில் எந்த நேரம் உங்களுக்கு வசதியாக இருக்கும்?"
                 )
             elif lang == "es":
                 msg = (
-                    f"¡Por supuesto, {patient_name}! Disponemos de horarios matutinos adicionales con el Dr. Aris Thorne en {facility}: "
+                    f"¡Por supuesto, {patient_name}! Disponemos de horarios matutinos adicionales con el {doc_name} en {facility}: "
                     "Viernes a las 9:00 AM y Lunes a las 10:30 AM. ¿Cuál de estos horarios de la mañana le resulta más conveniente?"
                 )
             elif lang == "ar":
                 msg = (
-                    f"بالتأكيد يا {patient_name}! تتوفر مواعيد صباحية بديلة لدى د. أريس ثورن في {facility}: "
+                    f"بالتأكيد يا {patient_name}! تتوفر مواعيد صباحية بديلة لدى {doc_name} في {facility}: "
                     "الجمعة الساعة 9:00 صباحاً والإثنين الساعة 10:30 صباحاً. أي من هذين الموعدين الصباحيين يناسبك أكثر؟"
                 )
             else:
                 msg = (
-                    f"Certainly, {patient_name}! Here are alternative morning openings with Dr. Aris Thorne at {facility}: "
+                    f"Certainly, {patient_name}! Here are alternative morning openings with {doc_name} at {facility}: "
                     "Friday at 9:00 AM and Monday at 10:30 AM. Would either of these morning times work better for your schedule?"
                 )
         elif pref_topic == "afternoon":
             if lang == "ta":
                 msg = (
-                    f"நிச்சயமாக {patient_name}! டாக்டர் அரிஸ் தோர்ன் அவர்களின் Clinic A மையத்தில் கூடுதல் மதிய நேரங்கள் கிடைக்கின்றன: "
+                    f"நிச்சயமாக {patient_name}! டாக்டர் {doc_name} அவர்களின் {facility} மையத்தில் கூடுதல் மதிய நேரங்கள் கிடைக்கின்றன: "
                     "வெள்ளிக்கிழமை மதியம் 2:00 மணி மற்றும் திங்கட்கிழமை மதியம் 3:30 மணி. இவற்றில் எந்த நேரம் உங்களுக்கு வசதியாக இருக்கும்?"
                 )
             elif lang == "es":
                 msg = (
-                    f"¡Por supuesto, {patient_name}! Disponemos de horarios por la tarde con el Dr. Aris Thorne en {facility}: "
+                    f"¡Por supuesto, {patient_name}! Disponemos de horarios por la tarde con el {doc_name} en {facility}: "
                     "Viernes a las 2:00 PM y Lunes a las 3:30 PM. ¿Cuál de estos horarios le resulta más conveniente?"
                 )
             elif lang == "ar":
                 msg = (
-                    f"بالتأكيد يا {patient_name}! تتوفر مواعيد مسائية بديلة لدى د. أريس ثورن في {facility}: "
+                    f"بالتأكيد يا {patient_name}! تتوفر مواعيد مسائية بديلة لدى {doc_name} في {facility}: "
                     "الجمعة الساعة 2:00 ظهراً والإثنين الساعة 3:30 عصراً. أي من هذين الموعدين يناسبك أكثر؟"
                 )
             else:
                 msg = (
-                    f"Certainly, {patient_name}! Here are alternative afternoon openings with Dr. Aris Thorne at {facility}: "
+                    f"Certainly, {patient_name}! Here are alternative afternoon openings with {doc_name} at {facility}: "
                     "Friday at 2:00 PM and Monday at 3:30 PM. Would either of these afternoon times work better for your schedule?"
                 )
         else:
             if lang == "ta":
                 msg = (
-                    f"நிச்சயமாக {patient_name}! டாக்டர் அரிஸ் தோர்ன் அவர்களின் Clinic A மையத்தில் கூடுதல் நேரங்கள் கிடைக்கின்றன: "
+                    f"நிச்சயமாக {patient_name}! டாக்டர் {doc_name} அவர்களின் {facility} மையத்தில் கூடுதல் நேரங்கள் கிடைக்கின்றன: "
                     "வெள்ளிக்கிழமை காலை 9:00 மணி, திங்கட்கிழமை காலை 11:00 மணி, மற்றும் அடுத்த புதன்கிழமை மதியம் 3:30 மணி. "
                     "இவற்றில் எந்த நேரம் உங்களுக்கு வசதியாக இருக்கும்?"
                 )
             elif lang == "es":
                 msg = (
-                    f"¡Por supuesto, {patient_name}! Aquí tiene horarios adicionales disponibles con el Dr. Aris Thorne en {facility}: "
+                    f"¡Por supuesto, {patient_name}! Aquí tiene horarios adicionales disponibles con el {doc_name} en {facility}: "
                     "Viernes a las 9:00 AM, Lunes a las 11:00 AM y el próximo Miércoles a las 3:30 PM. ¿Alguno de estos horarios se adapta a su agenda?"
                 )
             elif lang == "ar":
                 msg = (
-                    f"بالتأكيد يا {patient_name}! فيما يلي مواعيد إضافية متاحة لدى د. أريس ثورن في {facility}: "
+                    f"بالتأكيد يا {patient_name}! فيما يلي مواعيد إضافية متاحة لدى {doc_name} في {facility}: "
                     "الجمعة الساعة 9:00 صباحاً، الإثنين الساعة 11:00 صباحاً، والأربعاء القادم الساعة 3:30 عصراً. هل يناسبك أي من هذه المواعيد؟"
                 )
             else:
                 msg = (
-                    f"Certainly, {patient_name}! Here are additional upcoming openings with Dr. Aris Thorne at {facility}: "
+                    f"Certainly, {patient_name}! Here are additional upcoming openings with {doc_name} at {facility}: "
                     "Friday at 9:00 AM, Monday at 11:00 AM, and next Wednesday at 3:30 PM. Would any of these alternative times work better for your schedule?"
                 )
 
@@ -461,9 +463,10 @@ class CareCoordinationAgent:
     ) -> CoordinationPlan:
         """Filters and presents slots matching patient time preferences (e.g. morning vs afternoon)."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
-        facility = case_context.get("facility") or "Clinic A - Women's Specialty Breast Center"
+        doc_name = case_context.get("assigned_doctor_name") or case_context.get("doctor_name") or "Dr. Arjun Menon"
+        facility = case_context.get("facility") or "CareBridge Demo Clinic"
         specialty = case_context.get("specialty") or "Breast Oncology"
         pref = intent.inquiry_topic or "morning"
 
@@ -495,13 +498,13 @@ class CareCoordinationAgent:
         if lang == "ta":
             msg = (
                 f"காலை நேரமே உங்களுக்கு வசதியானது என்பதை குறித்துக்கொண்டோம் {patient_name}! "
-                "டாக்டர் அரிஸ் தோர்ன் அவர்களின் மையத்தில் வெள்ளிக்கிழமை காலை 9:00 மணி மற்றும் செவ்வாய் காலை 10:00 மணி "
+                f"டாக்டர் {doc_name} அவர்களின் மையத்தில் வெள்ளிக்கிழமை காலை 9:00 மணி மற்றும் செவ்வாய் காலை 10:00 மணி "
                 "ஆகிய காலை நேரங்களில் இடங்கள் உள்ளன. இதில் எது உங்களுக்கு வசதியாக இருக்கும்?"
             )
         else:
             msg = (
                 f"I have noted your preference for morning visits, {patient_name}! "
-                "We have morning openings available on Friday at 9:00 AM and next Tuesday at 10:00 AM with Dr. Aris Thorne. "
+                f"We have morning openings available on Friday at 9:00 AM and next Tuesday at 10:00 AM with {doc_name}. "
                 "Would either of these morning times work for you?"
             )
 
@@ -523,9 +526,10 @@ class CareCoordinationAgent:
     ) -> CoordinationPlan:
         """Resolves ordinal or specific slot selection (e.g. 'the second one') and initiates reservation."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
-        facility = case_context.get("facility") or "Clinic A - Women's Specialty Breast Center"
+        doc_name = case_context.get("assigned_doctor_name") or case_context.get("doctor_name") or "Dr. Arjun Menon"
+        facility = case_context.get("facility") or "CareBridge Demo Clinic"
         selection = intent.inquiry_topic or "slot_2"
 
         if selection == "slot_1":
@@ -552,7 +556,7 @@ class CareCoordinationAgent:
                     "case_id": case_id,
                     "patient_id": str(patient_context.get("id") or patient_context.get("patient_id") or ""),
                     "facility": facility,
-                    "provider_name": "Dr. Aris Thorne",
+                    "provider_name": doc_name,
                     "appointment_type": "Diagnostic Evaluation",
                     "scheduled_time": slot_desc,
                     "status": "booked",
@@ -579,13 +583,13 @@ class CareCoordinationAgent:
 
         if lang == "ta":
             msg = (
-                f"அருமை {patient_name}! நீங்கள் தேர்வு செய்த {ordinal_text_ta}யை ({slot_desc_ta}, டாக்டர் அரிஸ் தோர்ன், {facility}) "
+                f"அருமை {patient_name}! நீங்கள் தேர்வு செய்த {ordinal_text_ta}யை ({slot_desc_ta}, டாக்டர் {doc_name}, {facility}) "
                 "முன்பதிவு செய்ய நடவடிக்கை எடுத்துள்ளோம். உங்கள் பராமரிப்பு ஒருங்கிணைப்பாளர் பிரியா நாயர் இதனை உறுதி செய்வார். "
                 "சந்திப்பிற்கு முன் உங்களுக்கு நினைவூட்டல் செய்தி அனுப்பப்படும்."
             )
         else:
             msg = (
-                f"Wonderful, {patient_name}! I have selected the {ordinal_text} for you ({slot_desc} with Dr. Aris Thorne at {facility}). "
+                f"Wonderful, {patient_name}! I have selected the {ordinal_text} for you ({slot_desc} with {doc_name} at {facility}). "
                 "We have initiated your booking confirmation, and your care coordinator Priya Nair, RN will finalize your appointment details. "
                 "You will receive a confirmation reminder prior to your visit."
             )
@@ -608,9 +612,10 @@ class CareCoordinationAgent:
     ) -> CoordinationPlan:
         """Handles patient reschedule requests by querying upcoming openings and offering flexible times."""
         case_id = str(case_context.get("case_id") or case_context.get("id") or "")
-        patient_name = patient_context.get("full_name") or patient_context.get("first_name", "Valued Patient")
+        patient_name = patient_context.get("first_name") or (patient_context.get("full_name", "").split()[0] if patient_context.get("full_name") else "")
         lang = cls._resolve_lang(intent, patient_context)
-        facility = case_context.get("facility") or "Clinic A - Women's Specialty Breast Center"
+        doc_name = case_context.get("assigned_doctor_name") or case_context.get("doctor_name") or "Dr. Arjun Menon"
+        facility = case_context.get("facility") or "CareBridge Demo Clinic"
         specialty = case_context.get("specialty") or "Breast Oncology"
 
         actions: List[ProposedAction] = [

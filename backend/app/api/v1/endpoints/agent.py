@@ -19,6 +19,7 @@ from sqlalchemy.orm import selectinload
 
 from app.database.session import get_async_db, async_session_factory, get_sync_db
 from app.models.care_case import CareCase, Task
+from app.models.patient import Patient
 from app.models.event_audit import CaseEvent
 from app.models.communication import Communication, ConversationSession
 from app.models.appointment import Appointment
@@ -186,6 +187,68 @@ async def generate_agent_stream(
             db.add(inbound_comm)
             await db.commit()
 
+            def _to_uuid(val: Any) -> Optional[uuid.UUID]:
+                if not val:
+                    return None
+                if isinstance(val, uuid.UUID):
+                    return val
+                try:
+                    return uuid.UUID(str(val))
+                except (ValueError, TypeError, AttributeError):
+                    return None
+
+            # Resolve Case and Patient context for patient or coordinator
+            target_case: Optional[CareCase] = None
+            target_patient: Optional[Patient] = None
+            case_uuid = _to_uuid(req.case_id) or _to_uuid(active_session.case_id)
+            if case_uuid:
+                try:
+                    c_stmt = (
+                        select(CareCase)
+                        .options(
+                            selectinload(CareCase.patient),
+                            selectinload(CareCase.current_owner),
+                            selectinload(CareCase.screening_result)
+                        )
+                        .where(CareCase.id == case_uuid)
+                    )
+                    c_res = await db.execute(c_stmt)
+                    target_case = c_res.scalar_one_or_none()
+                except Exception as e:
+                    logger.warning(f"Failed to load case by id {case_uuid}: {e}")
+
+            p_uuid = _to_uuid(current_user.patient_id)
+            if not target_case and user_role == "patient" and p_uuid:
+                try:
+                    c_stmt = (
+                        select(CareCase)
+                        .options(
+                            selectinload(CareCase.patient),
+                            selectinload(CareCase.current_owner),
+                            selectinload(CareCase.screening_result)
+                        )
+                        .where(CareCase.patient_id == p_uuid)
+                        .order_by(CareCase.created_at.desc())
+                    )
+                    c_res = await db.execute(c_stmt)
+                    target_case = c_res.scalars().first()
+                except Exception as e:
+                    logger.warning(f"Failed to load case by patient_id: {e}")
+
+            if target_case:
+                target_patient = target_case.patient
+                if not active_session.case_id:
+                    active_session.case_id = target_case.id
+                if not active_session.patient_id and target_case.patient_id:
+                    active_session.patient_id = target_case.patient_id
+            elif user_role == "patient" and p_uuid:
+                try:
+                    p_stmt = select(Patient).where(Patient.id == p_uuid)
+                    p_res = await db.execute(p_stmt)
+                    target_patient = p_res.scalar_one_or_none()
+                except Exception as e:
+                    logger.warning(f"Failed to load patient: {e}")
+
             # Cancellation check
             if await request.is_disconnected():
                 logger.info("Client disconnected before stream execution.")
@@ -342,14 +405,6 @@ async def generate_agent_stream(
                         "• **Why 4 (Coordinator Role)**: Dedicated coordinator assists with scheduling, ride vouchers, and obstacle removal.\n"
                         "• **Why 5 (Solution)**: Secured appointment with transit support and continuous closed-loop follow-up."
                     )
-                elif any(term in msg_lower for term in ["my report what saying", "what report saying", "report what saying", "what does my report say", "que dice mi informe", "ماذا يقول تقريري"]):
-                    primary_intent = "case_context_inquiry"
-                    if detected_language == "ar":
-                        draft_response = "يشير تقرير الفحص إلى وجود تغيرات نسيجية تتطلب تقييماً تشخيصياً إضافياً للتأكد من سلامتك. سنقوم بترتيب موعد استشارة لمناقشة النتائج بالتفصيل."
-                    elif detected_language == "es":
-                        draft_response = "Su informe de detección indica hallazgos que requieren una evaluación diagnóstica de seguimiento. Estamos aquí para coordinar su cita con el especialista."
-                    else:
-                        draft_response = "Your screening report indicates diagnostic findings that recommend further evaluation. We are coordinating with your physician's office to ensure you receive timely, clear follow-up care."
                 elif any(term in msg_lower for term in [
                     "book an appointment", "book appointment", "schedule an appointment", "want to book", "want book",
                     "i want book doctor tomorrow", "need to see doctor", "appointment tomorrow", "schedule for me"
@@ -372,7 +427,7 @@ async def generate_agent_stream(
                         "2. **Tomorrow at 2:30 PM** (Afternoon)\n\n"
                         "Which time works best for you?"
                     )
-                elif len(msg_lower.split()) <= 2 and msg_lower not in ("hello", "hi", "hey") and not any(k in msg_lower for k in ["book", "report", "result", "doctor", "pain", "ride"]):
+                elif len(msg_lower.split()) <= 2 and msg_lower not in ("hello", "hi", "hey") and not any(k in msg_lower for k in ["book", "report", "result", "doctor", "pain", "ride", "stage", "journey", "where"]):
                     # Low confidence ambiguous input: ask one short clarifying question, never default to booking
                     primary_intent = "clarification_needed"
                     if detected_language == "ar":
@@ -382,9 +437,62 @@ async def generate_agent_stream(
                     else:
                         draft_response = "Could you please clarify how I can best assist you? I can help explain your screening results, answer questions about your care pathway, or coordinate an appointment with your clinic."
                 else:
-                    patient_ctx: Dict[str, Any] = {}
+                    u_display = getattr(current_user, "name", None) or getattr(current_user, "full_name", None) or ""
+                    patient_first = (
+                        target_patient.first_name if target_patient
+                        else (u_display.split()[0] if u_display else "")
+                    )
+                    patient_full = (
+                        f"{target_patient.first_name} {target_patient.last_name}" if target_patient
+                        else (u_display or patient_first)
+                    )
+                    patient_ctx: Dict[str, Any] = {
+                        "patient_id": str(target_patient.id) if target_patient else str(current_user.patient_id or ""),
+                        "full_name": patient_full,
+                        "first_name": patient_first,
+                        "preferred_language": (target_patient.preferred_language if target_patient else "en") or "en",
+                    }
                     case_ctx: Dict[str, Any] = {}
-                    conv_ctx = {"inbound_sender": "patient", "recent_messages": []}
+                    if target_case:
+                        case_ctx = dict(target_case.case_context or {})
+                        case_ctx["case_id"] = str(target_case.id)
+                        case_ctx["case_number"] = target_case.case_number
+                        case_ctx["status"] = target_case.status
+                        case_ctx["priority"] = target_case.priority
+                        case_ctx["clinical_pathway"] = target_case.clinical_pathway
+                        if target_case.screening_result:
+                            case_ctx["screening_type"] = target_case.screening_result.screening_type or case_ctx.get("screening_type", "Mammogram")
+                            case_ctx["finding_code"] = target_case.screening_result.finding_code or case_ctx.get("finding_code", "BI-RADS 4")
+                            case_ctx["finding_summary"] = target_case.screening_result.finding_summary or case_ctx.get("finding_summary", "")
+                            case_ctx["screening_result"] = target_case.screening_result.raw_report_data or {}
+                            case_ctx["raw_report_data"] = target_case.screening_result.raw_report_data or {}
+
+                        doc = target_case.current_owner if (target_case.current_owner and target_case.current_owner.role in ("doctor", "clinician", "specialist")) else None
+                        case_ctx["assigned_doctor"] = case_ctx.get("assigned_doctor") or (doc.name if doc else "Dr. Arjun Menon, MD")
+                        case_ctx["doctor_name"] = case_ctx.get("doctor_name") or case_ctx["assigned_doctor"]
+                        case_ctx["assigned_doctor_name"] = case_ctx["doctor_name"]
+                        case_ctx["coordinator_name"] = case_ctx.get("coordinator_name") or "Priya Nair, RN"
+                        case_ctx["current_owner_name"] = case_ctx["coordinator_name"]
+
+                        from app.services.lifecycle_service import LifecycleService
+                        case_ctx["lifecycle_stages"] = LifecycleService.get_lifecycle_stages(target_case)
+                        curr_st = LifecycleService.get_current_stage(target_case)
+                        case_ctx["current_stage_number"] = curr_st.get("stage_number", 4)
+                        case_ctx["current_stage_id"] = curr_st.get("stage_id", "PATIENT_UNDERSTANDS")
+                        case_ctx["current_stage_title"] = curr_st.get("title", "Understanding Results")
+
+                    recent_comms_stmt = (
+                        select(Communication)
+                        .where(Communication.session_id == active_session.id)
+                        .order_by(Communication.sent_at.desc())
+                        .limit(6)
+                    )
+                    recent_comms = (await db.execute(recent_comms_stmt)).scalars().all()
+                    conv_ctx = {
+                        "inbound_sender": "patient",
+                        "recent_messages": list(reversed(recent_comms))
+                    }
+
                     intent = CognitiveEngine.analyze_intent(req.message, patient_ctx, case_ctx, conv_ctx)
                     plan = CognitiveEngine.formulate_plan(intent, patient_ctx, case_ctx, conv_ctx)
                     draft_response = plan.patient_response_draft

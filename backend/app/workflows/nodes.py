@@ -308,7 +308,7 @@ def draft_patient_communication_node(state: CareBridgeState) -> Dict[str, Any]:
             # 2. Formulate empathetic communication via LLM or deterministic fallback
             screening = db.query(ScreeningResult).filter(ScreeningResult.id == case.screening_result_id).first()
             findings_summary = screening.finding_summary if screening else "Follow-up screening review required"
-            patient_name = f"{patient.first_name} {patient.last_name}" if patient else "Valued Patient"
+            patient_name = f"{patient.first_name} {patient.last_name}" if patient else ""
 
             prompt = (
                 f"Draft an empathetic, supportive, and non-alarmist patient notification for {patient_name} in language '{lang}'.\n"
