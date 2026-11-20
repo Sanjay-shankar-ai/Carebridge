@@ -75,6 +75,37 @@ def test_knowledge_retrieval_strictly_enforces_reviewed_role_and_language():
     assert empty_docs == []
 
 
+def test_cancellation_knowledge_file_audience_and_inline_comment_reviewed_gate(tmp_path):
+    # Installed convo-cancellation-reasons-v1.md has reviewed: false with inline comment -> must be ignored!
+    all_docs = {d["id"]: d for d in KnowledgeRetrievalService.load_all()}
+    assert "convo-cancellation-reasons-v1" in all_docs
+    meta = all_docs["convo-cancellation-reasons-v1"]
+    assert meta["role"] == "patient" and meta["audience"] == "patient"
+    assert meta["language"] == "en" and meta["type"] == "conversation"
+    assert meta["reviewed"] is False
+
+    hits = KnowledgeRetrievalService.retrieve(
+        "cancel transport work schedule fear cost caregiver", role="patient", language="en", limit=10
+    )
+    assert all(d["id"] != "convo-cancellation-reasons-v1" for d in hits)
+
+    # Once reviewed: true (even with an inline YAML comment), audience: patient is retrieved ONLY for patient+en
+    reviewed_copy = tmp_path / "convo-cancellation-reasons-v1.md"
+    raw = (
+        KnowledgeRetrievalService.load_all()[0]["path"]
+    )
+    from pathlib import Path
+    src_text = (Path(raw).parent / "convo-cancellation-reasons-v1.md").read_text(encoding="utf-8")
+    reviewed_copy.write_text(src_text.replace("reviewed: false", "reviewed: true"), encoding="utf-8")
+
+    ok = KnowledgeRetrievalService.retrieve(
+        "transport work schedule fear cost", role="patient", language="en", knowledge_dir=tmp_path
+    )
+    assert len(ok) == 1 and ok[0]["id"] == "convo-cancellation-reasons-v1" and ok[0]["reviewed"] is True
+    assert KnowledgeRetrievalService.retrieve("transport cost", role="doctor", language="en", knowledge_dir=tmp_path) == []
+    assert KnowledgeRetrievalService.retrieve("transport cost", role="patient", language="es", knowledge_dir=tmp_path) == []
+
+
 def test_consecutive_replies_never_start_with_same_sentence(db):
     w = make_world(db, tag="dedup")
 

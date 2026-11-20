@@ -13,7 +13,8 @@ Branch: `feat/ai-behaviours` (never pushed). Synthetic data only.
 | B6 | Conversation quality + reviewed knowledge | DONE | `agents/prompts.py` (`CONVERSATION_PROMPT`), `knowledge/*.md` (6 `reviewed: true` + 1 `reviewed: false` negative control), `services/knowledge_retrieval_service.py`, `services/response_guard_service.py` (consecutive opening-sentence dedup), `services/patient_behaviour_router.py`, `api/v1/endpoints/agent.py`, `tests/behaviours/test_b6_quality_and_security.py` | `pytest backend/tests/behaviours -q` -> **38 passed in 23.35s** (10 B1 + 5 B2 + 5 B3 + 8 B4 + 5 B5 + 5 B6/guard/security; real Postgres `carebridge_test`, LLM mocked). |
 
 ## Notes
-- `CONVERSATION_PROMPT` in `backend/app/agents/prompts.py` matches the exact provided prompt verbatim, with `render_conversation_prompt(...)` filling only tool-grounded placeholders (`{{first_name_or_blank}}`, `{{language}}`, `{{date}}`, `{{care_journey}}`, `{{report_status}}`, `{{doctor_name}}`, `{{coordinator_name}}`, `{{appointment}}`, `{{transport_status}}`). Knowledge files in `backend/app/knowledge/` have 6 `reviewed: true` files + 1 `reviewed: false` negative control.
+- `CONVERSATION_PROMPT` in `backend/app/agents/prompts.py` matches the exact provided prompt verbatim, with `render_conversation_prompt(...)` filling only tool-grounded placeholders (`{{first_name_or_blank}}`, `{{language}}`, `{{date}}`, `{{care_journey}}`, `{{report_status}}`, `{{doctor_name}}`, `{{coordinator_name}}`, `{{appointment}}`, `{{transport_status}}`).
+- `backend/app/knowledge/convo-cancellation-reasons-v1.md` is installed verbatim (`reviewed: false` with inline YAML comment); `KnowledgeRetrievalService` parses `audience`/`role`, `id`, `type`, `owner`, and inline `#` comments, ignoring unreviewed files until `reviewed: true`.
 
 ## Full Suite Before vs After (exact counts)
 - **Before (baseline on `feat/ai-behaviours`, before B1–B6):**

@@ -14,8 +14,24 @@ from typing import Any, Dict, List, Optional, Tuple
 DEFAULT_KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
 
 
+def _strip_yaml_value(raw_val: str) -> Any:
+    """Strips inline YAML comments (outside quotes), unquotes strings, and parses booleans."""
+    s = raw_val.strip()
+    if len(s) >= 2 and s[0] in ('"', "'") and s[0] in s[1:]:
+        quote = s[0]
+        end_idx = s.find(quote, 1)
+        return s[1:end_idx]
+    if "#" in s:
+        s = s.split("#", 1)[0].strip()
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    return s
+
+
 def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
-    """Parses simple YAML frontmatter delimited by --- lines."""
+    """Parses simple YAML frontmatter delimited by --- lines (supports inline # comments and audience/role)."""
     text = raw.lstrip("\ufeff")
     if not text.startswith("---"):
         return {}, text.strip()
@@ -25,17 +41,10 @@ def _parse_frontmatter(raw: str) -> Tuple[Dict[str, Any], str]:
     meta: Dict[str, Any] = {}
     for line in parts[1].splitlines():
         line = line.strip()
-        if not line or ":" not in line:
+        if not line or line.startswith("#") or ":" not in line:
             continue
         k, v = line.split(":", 1)
-        k = k.strip().lower()
-        v_str = v.strip()
-        if v_str.lower() == "true":
-            meta[k] = True
-        elif v_str.lower() == "false":
-            meta[k] = False
-        else:
-            meta[k] = v_str
+        meta[k.strip().lower()] = _strip_yaml_value(v)
     return meta, parts[2].strip()
 
 
@@ -65,12 +74,15 @@ class KnowledgeRetrievalService:
             raw = path.read_text(encoding="utf-8")
             meta, body = _parse_frontmatter(raw)
             docs.append({
-                "id": path.stem,
+                "id": str(meta.get("id") or path.stem),
                 "path": str(path),
-                "title": meta.get("title") or path.stem,
-                "role": _normalize_role(str(meta.get("role", ""))),
+                "title": str(meta.get("title") or meta.get("id") or path.stem),
+                "type": str(meta.get("type", "")).lower().strip(),
+                "role": _normalize_role(str(meta.get("audience") or meta.get("role") or "")),
+                "audience": _normalize_role(str(meta.get("audience") or meta.get("role") or "")),
                 "language": str(meta.get("language", "")).lower().strip(),
                 "topic": str(meta.get("topic", "")).lower().strip(),
+                "owner": str(meta.get("owner", "")).strip(),
                 "reviewed": meta.get("reviewed") is True,
                 "body": body,
             })
