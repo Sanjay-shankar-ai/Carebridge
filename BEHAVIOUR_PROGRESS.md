@@ -13,4 +13,12 @@ Branch: `feat/ai-behaviours` (never pushed). Synthetic data only.
 | B6 | Conversation quality + reviewed knowledge | DONE | `agents/prompts.py` (`CONVERSATION_PROMPT`), `knowledge/*.md` (6 `reviewed: true` + 1 `reviewed: false` negative control), `services/knowledge_retrieval_service.py`, `services/response_guard_service.py` (consecutive opening-sentence dedup), `services/patient_behaviour_router.py`, `api/v1/endpoints/agent.py`, `tests/behaviours/test_b6_quality_and_security.py` | `pytest backend/tests/behaviours -q` -> **38 passed in 23.35s** (10 B1 + 5 B2 + 5 B3 + 8 B4 + 5 B5 + 5 B6/guard/security; real Postgres `carebridge_test`, LLM mocked). |
 
 ## Notes
-- The brief says "CONVERSATION PROMPT and knowledge files below" but none were attached; B6 creates them from the rules in the brief.
+- The brief says "CONVERSATION PROMPT and knowledge files below" but none were attached; B6 created `CONVERSATION_PROMPT` and 7 YAML-frontmatter knowledge files (6 `reviewed: true`, 1 `reviewed: false` negative control) from the rules in the brief.
+
+## Full Suite Before vs After (exact counts)
+- **Before (baseline on `feat/ai-behaviours`, before B1–B6):**
+  `pytest backend/tests -q -p no:cacheprovider` -> **256 passed, 37 failed, 13 errors** (306 total; 262.81s). Pre-existing failures saved in `backend/tests/.baseline_failures.txt` (SQLite tests with missing `case_owners` table and offline server/env tests).
+- **After (all B1–B6 implemented, 344 total tests):**
+  1. `pytest backend/tests -q -p no:cacheprovider` (with server stopped): **280 passed, 43 failed, 21 errors** (344 total; 331.82s). All 38 new tests in `backend/tests/behaviours` passed; the only delta vs baseline was 14 HTTP tests requiring `127.0.0.1:8000`.
+  2. With `uvicorn` running on `127.0.0.1:8000`, `pytest backend/tests/behaviours backend/tests/test_issue2_coordinator_patients.py backend/tests/test_issue3_streaming_chat.py backend/tests/test_judge_demo_data.py backend/tests/test_report_upload.py backend/tests/test_plain_language_report.py backend/tests/test_patient_counselling_ai.py -q -p no:cacheprovider` -> **82 passed, 0 failed, 0 errors** (86.77s). Zero regressions introduced.
+
